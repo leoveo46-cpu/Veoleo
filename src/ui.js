@@ -315,6 +315,11 @@ class Mqtt {
       };
     });
   }
+  kick() { // الهاتف أيقظ الصفحة: الاتصال قد يكون ميتاً بصمت — نعيد فتحه فوراً
+    if (this.closed) return;
+    if (this.connected) { try { this.ws.close(); } catch (e) { /* */ } return; }
+    clearTimeout(this.rT); this.rT = null; this.retry = 0; this.connect().catch(() => this.reconnectLater());
+  }
   reconnectLater() {
     if (this.closed || this.rT) return;
     const delay = Math.min(8000, 400 * Math.pow(2, this.retry++)) + Math.random() * 300;
@@ -402,10 +407,12 @@ function hostTransport(code, onConn) {
   };
   clients.forEach(c => { c.subscribe(T + 'u'); c.subscribe(T + 'd'); c.on('message', (tp, txt) => { if (tp === T + 'u') handle(tp, txt); else watchDown(tp, txt); }); });
   const hb = setInterval(() => pub({ to: '*', d: { t: 'hb', seq: Net.seq } }), 3000);
-  const sweep = setInterval(() => { const now = Date.now(); Object.values(conns).forEach(c => { if (now - c.lastSeen > 15000) drop(c); }); }, 3000);
+  const sweep = setInterval(() => { const now = Date.now(); Object.values(conns).forEach(c => { if (now - c.lastSeen > 25000) drop(c); }); }, 3000);
+  const onVisH = () => { if (document.visibilityState === 'visible') { clients.forEach(c => { if (!c.connected) c.kick(); }); pub({ to: '*', d: { t: 'hb', seq: Net.seq } }); } };
+  document.addEventListener('visibilitychange', onVisH); window.addEventListener('online', onVisH);
   const api = { broadcast: d => pub({ to: '*', d }), online: () => clients.filter(c => c.connected).length, foreign: () => foreign,
     stopWatch: () => clients.forEach(c => c.unsubscribe(T + 'd')),
-    destroy() { clearInterval(hb); clearInterval(sweep); clients.forEach(c => c.close()); } };
+    destroy() { clearInterval(hb); clearInterval(sweep); document.removeEventListener('visibilitychange', onVisH); window.removeEventListener('online', onVisH); clients.forEach(c => c.close()); } };
   return new Promise((res, rej) => {
     let left = clients.length, resolved = false;
     clients.forEach(c => c.connect(7000).then(() => {
@@ -465,6 +472,13 @@ function guestTransport(code) {
         }, () => { c.close(); if (--pending === 0 && !won) switching = false; }); });
       };
       const ping = setInterval(() => send({ t: 'ping' }), 4000);
+      const onVis = () => {
+        if (document.visibilityState !== 'visible' || !alive) return;
+        send({ t: 'ping' });
+        if (Date.now() - lastHost > 5000) { client.kick(); }
+        conn.emit('reconnect');
+      };
+      document.addEventListener('visibilitychange', onVis); window.addEventListener('pageshow', onVis); window.addEventListener('online', onVis);
       const watch = setInterval(() => {
         const gap = Date.now() - lastHost;
         if (offlineSince && Date.now() - offlineSince > 6000) trySwitch();
@@ -472,7 +486,7 @@ function guestTransport(code) {
         if (gap > 120000 && alive) { alive = false; conn.destroy(); conn.emit('close'); }
       }, 2000);
       conn.send = send;
-      conn.destroy = () => { alive = false; clearInterval(ping); clearInterval(watch); try { send({ t: 'bye' }); } catch (e) { /* */ } const c = client; setTimeout(() => c && c.close(), 150); };
+      conn.destroy = () => { alive = false; clearInterval(ping); clearInterval(watch); document.removeEventListener('visibilitychange', onVis); window.removeEventListener('pageshow', onVis); window.removeEventListener('online', onVis); try { send({ t: 'bye' }); } catch (e) { /* */ } const c = client; setTimeout(() => c && c.close(), 150); };
       conn.close = conn.destroy;
       res(conn);
     };
