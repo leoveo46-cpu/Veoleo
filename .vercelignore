@@ -1,9 +1,7 @@
-# لا يُرفع إلى Vercel إلا index.html (اللعبة كاملة في ملف واحد)
+# Vercel يحتاج فقط index.html و vercel.json — المجلد public يُنشأ أثناء البناء
 src
 tests
 build.py
 progress.md
-README.md
-package.json
 node_modules
 *.log
