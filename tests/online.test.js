@@ -73,14 +73,18 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new
   });
   await test('مباراة كاملة: كل جهاز يلعب مقعده حتى الفوز', async () => {
     const pages = [host, guest, guest2];
-    let steps = 0, last = '';
-    while (steps++ < 6000) {
+    let steps = 0, last = '', lastTurn = 0, lastProgress = Date.now();
+    const deadline = Date.now() + 15 * 60000;
+    while (Date.now() < deadline) {
+      steps++;
       const hv = await view(host);
       if (hv.phase === 'gameOver') break;
+      if (hv.turn > lastTurn) { lastTurn = hv.turn; lastProgress = Date.now(); }
+      if (Date.now() - lastProgress > 60000) throw new Error(`stuck at turn ${hv.turn} phase ${hv.turnPhase} actor ${hv.actor}`);
       const a = hv.actor;
       const seatPage = a === 0 ? host : a === 1 ? guest : a === 2 ? guest2 : null;
       if (seatPage) {
-        const idle = await seatPage.evaluate(() => window.__ui.isIdle() && !document.querySelector('[data-action="card-ok"]'));
+        const idle = await seatPage.evaluate(() => window.__ui.isIdle() && !window.__ui.netBusy() && !document.querySelector('[data-action="card-ok"]'));
         const sig = JSON.stringify([hv.turn, hv.turnPhase, a, hv.players.map(p => p.cash)]);
         if (!idle) { const ck = seatPage.locator('[data-action="card-ok"]'); if (await ck.count()) await ck.click(); await seatPage.waitForTimeout(20); continue; }
         await seatPage.evaluate(() => { const S = window.__ui.state(); const m = window.MonoEngine.aiMove(S); return performMove(m); });
