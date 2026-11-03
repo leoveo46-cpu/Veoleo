@@ -8,7 +8,8 @@ const http = require('http'), fs = require('fs'), path = require('path');
 const { startBroker } = require('./helpers/mqtt-broker');
 const ROOT = path.join(__dirname, '..');
 let passed = 0, failed = 0;
-async function test(name, fn) { try { await fn(); passed++; console.log('  ✓', name); } catch (e) { failed++; console.log('  ✗', name, '\n     ', e.message.split('\n')[0]); } }
+let tIdx = 0;
+async function test(name, fn) { if (process.env.UPTO && ++tIdx > +process.env.UPTO) return; try { await fn(); passed++; console.log('  ✓', name); } catch (e) { failed++; console.log('  ✗', name, '\n     ', e.message.split('\n')[0]); } }
 const ok = (c, m) => { if (!c) throw new Error(m || 'assertion failed'); };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${m || ''} expected ${JSON.stringify(b)} got ${JSON.stringify(a)}`); };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -34,7 +35,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await host.click('[data-action="create-room"]');
   await host.waitForSelector('[data-room-code]', { timeout: 10000 });
   const code = await host.getAttribute('[data-room-code]', 'data-room-code');
-  let g1, g2;
+  let g1, g2, g3, g4;
 
   await test('المضيف ينشئ غرفة ويتصل بالخادمين', async () => { ok(/^[A-Z0-9]{5}$/.test(code)); eq(A.count() >= 1 && B.count() >= 1, true, 'host on both brokers'); });
   await test('ضيف من «شبكة أخرى» (يصل لخادم واحد فقط) ينضم عبر الرابط', async () => {
@@ -53,6 +54,40 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await g2.click('[data-action="join-room"]');
     await host.waitForFunction(() => window.__net.state().seats === 3, null, { timeout: 15000 });
   });
+  await test('لاعبان ينضمان في اللحظة نفسها دون تعارض (5 لاعبين)', async () => {
+    [g3, g4] = await Promise.all([device(`?room=${code}&broker=${both}`), device(`?room=${code}&broker=${onlyB}`)]);
+    await g3.fill('[data-player-config="0"] input', 'ضيف3'); await g4.fill('[data-player-config="0"] input', 'ضيف4');
+    await Promise.all([g3.click('[data-action="join-room"]'), g4.click('[data-action="join-room"]')]);
+    await host.waitForFunction(() => window.__net.state().seats === 5, null, { timeout: 15000 });
+    for (const g of [g1, g2, g3, g4]) await g.waitForFunction(() => window.__net.state().seats === 5, null, { timeout: 10000 });
+    const rows = await host.evaluate(() => [...document.querySelectorAll('[data-player-config]')].map(r => [r.querySelector('input').value, r.querySelector('.token-btn').getAttribute('aria-label'), r.querySelector('.color-btn').getAttribute('style')]));
+    eq(rows.map(r => r[0]), ['المضيف', 'ضيف1', 'ضيف2', 'ضيف3', 'ضيف4']);
+    eq(new Set(rows.map(r => r[1])).size, 5, 'unique tokens'); eq(new Set(rows.map(r => r[2])).size, 5, 'unique colors');
+    const seatsSeen = await Promise.all([g1, g2, g3, g4].map(g => net(g).then(n => n.mySeat)));
+    eq(seatsSeen, [1, 2, 3, 4], 'each guest sees own seat');
+  });
+  await test('تبويب مكرر (نفس بيانات التبويب) لا يستولي على مقعد لاعب آخر', async () => {
+    const cid2 = await g2.evaluate(() => sessionStorage.getItem('mono-cid'));
+    const dupPage = await g2.context().newPage();
+    await dupPage.route(/fonts\.(googleapis|gstatic)\.com/, r => r.abort());
+    await dupPage.addInitScript(([c, code]) => { try { if (!sessionStorage.getItem('dup-done')) { sessionStorage.setItem('mono-cid', c); sessionStorage.setItem('mono-guest-room', code); sessionStorage.setItem('dup-done', '1'); } } catch (e) { /* */ } }, [cid2, code]);
+    await dupPage.goto(URL + `?room=${code}&broker=${both}`);
+    await sleep(2500);
+    const dcid = await dupPage.evaluate(() => sessionStorage.getItem('mono-cid'));
+    ok(dcid !== cid2, 'duplicate got a new id');
+    eq((await net(dupPage)).role, null, 'duplicate did not auto-join');
+    eq((await net(host)).seats, 5); eq((await net(g2)).mySeat, 2, 'original keeps its seat');
+    await dupPage.close();
+  });
+  await test('غرفة جديدة لا يمكن أن تأخذ كود غرفة قائمة', async () => {
+    const other = await device(`?broker=${both}`);
+    await other.click('[data-mode="online"]');
+    await other.evaluate(c => window.__net.createRoom(c), code);
+    const oc = (await net(other)).code;
+    ok(oc && oc !== code, `got different code ${oc}`);
+    eq((await net(host)).seats, 5, 'original room untouched');
+    await other.evaluate(() => window.__net.leaveRoom()); await other.context().close();
+  });
   await test('كود خاطئ يعطي رسالة واضحة', async () => {
     const x = await device(`?broker=${both}`);
     await x.click('[data-mode="online"]'); await x.fill('[data-join-code]', 'ZZZZ9'); await x.click('[data-action="join-room"]');
@@ -64,12 +99,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await g1.waitForFunction(() => !!document.querySelector('.map-card.on[data-map="classic"]'), null, { timeout: 8000 });
     await host.evaluate(() => window.__ui.speed('instant'));
     await host.click('#start-btn');
-    for (const g of [g1, g2]) await g.waitForSelector('[data-screen="game"]:not(.hidden)', { timeout: 10000 });
-    eq((await view(g1)).players.map(p => p.name), ['المضيف', 'ضيف1', 'ضيف2']);
+    for (const g of [g1, g2, g3, g4]) await g.waitForSelector('[data-screen="game"]:not(.hidden)', { timeout: 10000 });
+    eq((await view(g1)).players.map(p => p.name), ['المضيف', 'ضيف1', 'ضيف2', 'ضيف3', 'ضيف4']);
     eq((await net(g1)).mySeat, 1); eq((await net(g2)).mySeat, 2);
   });
 
-  const pages = () => [host, g1, g2];
+  const pages = () => [host, g1, g2, g3, g4];
   const stats = { moves: 0, ms: 0 };
   async function play(maxSteps, until) {
     const deadline = Date.now() + Math.min(480000, maxSteps * 150);
@@ -90,13 +125,23 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     }
     return view(host);
   }
-  const synced = async () => { await sleep(600); const hv = await view(host); for (const g of [g1, g2]) { const gv = await view(g); eq([gv.turn, gv.players.map(p => [p.cash, p.pos])], [hv.turn, hv.players.map(p => [p.cash, p.pos])], 'state sync'); } return hv; };
+  const synced = async () => { await sleep(900); const hv = await view(host); for (const g of [g1, g2, g3, g4]) { const gv = await view(g); eq([gv.turn, gv.players.map(p => [p.cash, p.pos])], [hv.turn, hv.players.map(p => [p.cash, p.pos])], 'state sync'); } return hv; };
 
   await test('اللعب متزامن: النرد والحركة والأدوار عند الجميع', async () => {
     const hv0 = await view(host);
     const hv = await play(400, v => v.turn >= hv0.turn + 12);
     ok(hv.turn >= hv0.turn + 12, 'progressed'); await synced();
     ok((await g1.evaluate(() => document.querySelectorAll('.cell.owned').length)) === (await host.evaluate(() => document.querySelectorAll('.cell.owned').length)), 'board ownership drawn');
+  });
+  await test('ضياع رسالة حركة في الطريق: تُعاد تلقائياً ولا تُطبَّق مرتين', async () => {
+    await host.waitForFunction(() => { const v = JSON.parse(render_game_to_text()); return v.actor === 1 && v.turnPhase === 'preRoll'; }, null, { timeout: 60000, polling: 50 }).catch(async () => { await play(300, v => v.actor === 1 && v.turnPhase === 'preRoll'); });
+    await g1.waitForFunction(() => window.__ui.isIdle() && !window.__ui.netBusy(), null, { timeout: 10000 });
+    const before = await view(host);
+    B.dropNext(1, /\/u$/);
+    await g1.evaluate(() => performMove({ type: 'roll' }));
+    await host.waitForFunction(t => { const v = JSON.parse(render_game_to_text()); return v.turnPhase !== 'preRoll' || v.actor !== 1 || v.turn !== t; }, before.turn, { timeout: 12000 });
+    const after = await view(host);
+    ok(after.dice, 'rolled once'); await synced();
   });
   await test('انقطاع الخادم B فجأة: الضيف1 والمضيف يعيدان الاتصال تلقائياً ويكملان', async () => {
     B.dropAll();

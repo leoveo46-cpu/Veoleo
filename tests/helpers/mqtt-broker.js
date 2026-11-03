@@ -1,7 +1,7 @@
 /* خادم MQTT 3.1.1 مصغّر فوق WebSocket للاختبارات فقط (CONNECT/SUBSCRIBE/PUBLISH/PING/Will) */
 const http = require('http'), crypto = require('crypto');
 function startBroker(port) {
-  const clients = new Set();
+  const clients = new Set(); const drop = { n: 0, re: /$^/ };
   const server = http.createServer((q, r) => { r.writeHead(426); r.end(); });
   const frame = data => { const len = data.length; let head; if (len < 126) head = Buffer.from([0x82, len]); else if (len < 65536) { head = Buffer.alloc(4); head[0] = 0x82; head[1] = 126; head.writeUInt16BE(len, 2); } else { head = Buffer.alloc(10); head[0] = 0x82; head[1] = 127; head.writeBigUInt64BE(BigInt(len), 2); } return Buffer.concat([head, data]); };
   const str = (b, o) => { const l = b.readUInt16BE(o); return [b.slice(o + 2, o + 2 + l), o + 2 + l]; };
@@ -25,7 +25,8 @@ function startBroker(port) {
         const type = b[0] >> 4, p = b.slice(i, i + len); c.mq = b.slice(i + len);
         if (type === 1) { let o = 10; const flags = p[7]; let id; [id, o] = str(p, o); if (flags & 4) { let wt, wp; [wt, o] = str(p, o); [wp, o] = str(p, o); c.will = { topic: wt.toString(), payload: wp }; } send(Buffer.from([0x20, 2, 0, 0])); }
         else if (type === 8) { const id = p.slice(0, 2); let o = 2; const tps = []; while (o < p.length) { let tp; [tp, o] = str(p, o); o++; c.subs.add(tp.toString()); tps.push(0); } send(pkt(0x90, Buffer.concat([id, Buffer.from(tps)]))); }
-        else if (type === 3) { const [tp, o] = str(p, 0); route(tp.toString(), p.slice(o)); }
+        else if (type === 3) { const [tp, o] = str(p, 0); const ts = tp.toString(); if (drop.n > 0 && drop.re.test(ts)) { drop.n--; continue; } route(ts, p.slice(o)); }
+        else if (type === 10) { const id = p.slice(0, 2); let o = 2; while (o < p.length) { let tp; [tp, o] = str(p, o); c.subs.delete(tp.toString()); } send(pkt(0xB0, id)); }
         else if (type === 12) send(Buffer.from([0xD0, 0]));
         else if (type === 14) gone(true);
       }
@@ -48,6 +49,7 @@ function startBroker(port) {
   });
   function route(topic, payload) { const out = pkt(0x30, Buffer.concat([Buffer.from([topic.length >> 8, topic.length & 255]), Buffer.from(topic), payload])); clients.forEach(c => { if (c.subs.has(topic)) c.send(out); }); }
   return new Promise(res => server.listen(port || 0, '127.0.0.1', () => res({ port: server.address().port,
+    dropNext(n, re) { drop.n = n; drop.re = re; },
     dropAll() { clients.forEach(c => { try { c.sock.destroy(); } catch (e) { /* */ } }); },
     close() { clients.forEach(c => { try { c.sock.destroy(); } catch (e) { /* */ } }); return new Promise(r => server.close(r)); }, count: () => clients.size })));
 }

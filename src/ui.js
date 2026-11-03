@@ -255,6 +255,22 @@ const Net = {
   seatCids: [], wasHuman: {}, inGame: false,
   cid: (() => { try { let c = sessionStorage.getItem('mono-cid'); if (!c) { c = Math.random().toString(36).slice(2, 10); sessionStorage.setItem('mono-cid', c); } return c; } catch (e) { return Math.random().toString(36).slice(2, 10); } })(),
 };
+/* التبويب المكرر (Duplicate tab) ينسخ sessionStorage — نتأكد أن لكل تبويب معرّفاً فريداً حتى لا يتعارض لاعبان */
+const tabInst = Math.random().toString(36).slice(2, 10);
+const cidReady = new Promise(res => {
+  if (typeof BroadcastChannel === 'undefined') { res(); return; }
+  let dup = false, checked = false;
+  const bc = new BroadcastChannel('mono-tabs');
+  bc.onmessage = e => { const m = e.data || {};
+    if (m.q && m.q === Net.cid && m.i !== tabInst) bc.postMessage({ a: m.q, i: tabInst });
+    if (m.a && m.a === Net.cid && m.i !== tabInst && !checked) dup = true; };
+  bc.postMessage({ q: Net.cid, i: tabInst });
+  setTimeout(() => {
+    checked = true;
+    if (dup) { Net.cid = Math.random().toString(36).slice(2, 10); try { sessionStorage.setItem('mono-cid', Net.cid); sessionStorage.removeItem('mono-host-session'); sessionStorage.removeItem('mono-guest-room'); } catch (e) { /* */ } }
+    res();
+  }, 300);
+});
 const isOnline = () => !!Net.role;
 const isGuest = () => Net.role === 'guest';
 const isHost = () => Net.role === 'host';
@@ -341,6 +357,7 @@ class Mqtt {
   }
   sendSub(topic) { const id = this.pid = (this.pid % 65535) + 1; try { this.ws.send(mqPacket(0x82, [id >> 8, id & 255, ...mqStr(topic), 0])); } catch (e) { /* */ } }
   subscribe(topic) { this.subs.add(topic); if (this.connected) this.sendSub(topic); }
+  unsubscribe(topic) { if (!this.subs.delete(topic) || !this.connected) return; const id = this.pid = (this.pid % 65535) + 1; try { this.ws.send(mqPacket(0xA2, [id >> 8, id & 255, ...mqStr(topic)])); } catch (e) { /* */ } }
   publish(topic, payload) {
     if (!this.connected) { this.q.push([topic, payload]); if (this.q.length > 30) this.q.shift(); return false; }
     try { this.ws.send(mqPacket(0x30, [...mqStr(topic), ...enc.encode(payload)])); return true; } catch (e) { return false; }
@@ -367,9 +384,11 @@ function hostTransport(code, onConn) {
     };
     return Promise.resolve({ destroy() { Object.values(conns).forEach(c => c.close()); ch.close(); } });
   }
-  const T = topicOf(code), conns = {};
-  const clients = BROKERS.map(b => new Mqtt(b, { will: { topic: T + 'd', payload: JSON.stringify({ to: '*', d: { t: 'hostdrop' } }) } }));
-  const pub = obj => { const s = JSON.stringify(obj); let n = 0; clients.forEach(c => { if (c.connected && c.publish(T + 'd', s)) n++; }); return n; };
+  const T = topicOf(code), conns = {}, hid = Net.cid;
+  const clients = BROKERS.map(b => new Mqtt(b, { will: { topic: T + 'd', payload: JSON.stringify({ to: '*', h: hid, d: { t: 'hostdrop' } }) } }));
+  const pub = obj => { obj.h = hid; const s = JSON.stringify(obj); let n = 0; clients.forEach(c => { if (c.connected && c.publish(T + 'd', s)) n++; }); return n; };
+  let foreign = 0; // مضيف آخر يستخدم نفس الكود؟
+  const watchDown = (topic, txt) => { if (topic !== T + 'd') return; try { const m = JSON.parse(txt); if (m && m.h && m.h !== hid) foreign++; } catch (e) { /* */ } };
   const drop = c => { if (conns[c.cid] !== c) return; delete conns[c.cid]; c.open = false; c.emit('close'); };
   const vconn = cid => { const c = new Emitter(); Object.assign(c, { cid, open: true, lastSeen: Date.now(), send: d => pub({ to: cid, d }), close: () => drop(c) }); return c; };
   const handle = (topic, txt) => {
@@ -381,15 +400,16 @@ function hostTransport(code, onConn) {
     c.lastSeen = Date.now();
     if (m.d.t !== 'ping') c.emit('data', m.d);
   };
-  clients.forEach(c => { c.subscribe(T + 'u'); c.on('message', handle); });
-  const hb = setInterval(() => pub({ to: '*', d: { t: 'hb' } }), 3000);
+  clients.forEach(c => { c.subscribe(T + 'u'); c.subscribe(T + 'd'); c.on('message', (tp, txt) => { if (tp === T + 'u') handle(tp, txt); else watchDown(tp, txt); }); });
+  const hb = setInterval(() => pub({ to: '*', d: { t: 'hb', seq: Net.seq } }), 3000);
   const sweep = setInterval(() => { const now = Date.now(); Object.values(conns).forEach(c => { if (now - c.lastSeen > 15000) drop(c); }); }, 3000);
-  const api = { broadcast: d => pub({ to: '*', d }), online: () => clients.filter(c => c.connected).length,
+  const api = { broadcast: d => pub({ to: '*', d }), online: () => clients.filter(c => c.connected).length, foreign: () => foreign,
+    stopWatch: () => clients.forEach(c => c.unsubscribe(T + 'd')),
     destroy() { clearInterval(hb); clearInterval(sweep); clients.forEach(c => c.close()); } };
   return new Promise((res, rej) => {
     let left = clients.length, resolved = false;
     clients.forEach(c => c.connect(7000).then(() => {
-      if (!resolved) { resolved = true; setTimeout(() => res(api), 600); pub({ to: '*', d: { t: 'hb' } }); }
+      if (!resolved) { resolved = true; setTimeout(() => res(api), 600); }
     }, () => { c.reconnectLater(); if (--left === 0 && !resolved) { api.destroy(); rej(new Error('تعذّر الوصول إلى خوادم الاتصال — تحقق من الإنترنت ثم حاول مجدداً')); } }));
   });
 }
@@ -411,14 +431,16 @@ function guestTransport(code) {
       chosen = first; clearTimeout(timer);
       clients.forEach(c => { if (c !== first) c.close(); });
       const conn = new Emitter();
-      let client = null, lastHost = Date.now(), waiting = false, alive = true, offlineSince = 0, switching = false;
+      let client = null, lastHost = Date.now(), waiting = false, alive = true, offlineSince = 0, switching = false, hostId = first.hostId || null;
       const send = d => client && client.publish(T + 'u', JSON.stringify({ from: me, d }));
       const onMsg = (tp, txt) => {
         let m; try { m = JSON.parse(txt); } catch (e) { return; }
         if (!m || !m.d || (m.to !== me && m.to !== '*')) return;
+        if (!hostId && m.h) hostId = m.h;
+        if (m.h && hostId && m.h !== hostId) return; // تجاهل أي مضيف آخر
         lastHost = Date.now();
         if (waiting) { waiting = false; conn.emit('status', 'back'); }
-        if (m.d.t === 'hb') return;
+        if (m.d.t === 'hb') { conn.emit('hb', m.d); return; }
         if (m.d.t === 'hostdrop') { waiting = true; conn.emit('status', 'hostdrop'); return; }
         conn.emit('data', m.d);
       };
@@ -460,7 +482,7 @@ function guestTransport(code) {
     }, 12000);
     clients.forEach(c => {
       c.subscribe(T + 'd');
-      c.on('message', (tp, txt) => { if (chosen) return; let m; try { m = JSON.parse(txt); } catch (e) { return; } if (m && (m.to === '*' || m.to === me)) finish(c); });
+      c.on('message', (tp, txt) => { if (chosen) return; let m; try { m = JSON.parse(txt); } catch (e) { return; } if (m && m.d && (m.to === '*' || m.to === me) && m.d.t !== 'hostdrop') { c.hostId = m.h || null; finish(c); } });
       c.connect(7000).then(() => { reachable++; c.publish(T + 'u', JSON.stringify({ from: me, d: { t: 'ping' } })); },
         () => { if (++failed === clients.length) { clearTimeout(timer); rej(new Error('تعذّر الوصول إلى خوادم الاتصال — تحقق من الإنترنت ثم حاول مجدداً')); } });
     });
@@ -481,7 +503,8 @@ function netBroadcast(msg) {
   Object.values(Net.conns).forEach(c => { try { c.send(msg); } catch (e) { /* */ } });
 }
 function broadcastLobby() { if (isHost()) { netBroadcast({ t: 'lobby', lobby: lobbySnapshot(), code: Net.code }); saveHostSession(); } }
-function broadcastState(anim) { if (!isHost() || !S) return; Net.seq++; netBroadcast({ t: 'state', state: S, seq: Net.seq, anim: !!anim }); saveHostSession(); }
+const wireState = () => Object.assign({}, S, { log: S.log.slice(-60) }); // السجل كاملاً عند المضيف فقط
+function broadcastState(anim) { if (!isHost() || !S) return; Net.seq++; netBroadcast({ t: 'state', state: wireState(), seq: Net.seq, anim: !!anim }); saveHostSession(); }
 /* حفظ جلسة المضيف في هذا التبويب: إن أعاد تحميل الصفحة تعود الغرفة بنفس الكود ويكمل الجميع */
 const HOST_KEY = 'mono-host-session', GUEST_KEY = 'mono-guest-room';
 let hostSaveT = null;
@@ -496,6 +519,7 @@ async function resumeHost(d) {
   Net.busy = true; Net.status = 'جارٍ استعادة الغرفة…'; renderLobby();
   try {
     const peer = await hostTransport(d.code, onHostConn);
+    if (peer.stopWatch) peer.stopWatch();
     lobby.mode = 'online';
     Object.assign(Net, { role: 'host', code: d.code, peer, conns: {}, mySeat: 0, seq: d.seq || 0, inGame: !!d.inGame, wasHuman: d.wasHuman || {}, seatCids: d.seatCids || [], status: '' });
     Net.seats = d.seats || []; Net.seats[0] = Object.assign(lobby.players[0], Net.seats[0] || {}, { cid: Net.cid, isAI: false });
@@ -505,14 +529,16 @@ async function resumeHost(d) {
   Net.busy = false; if (!S) renderLobby();
 }
 
-async function createRoom() {
+async function createRoom(forceCode) {
   if (Net.busy) return;
   Net.busy = true; Net.status = 'جارٍ إنشاء الغرفة…'; renderLobby();
   try {
     let peer = null, code = null;
+    await cidReady;
     for (let k = 0; k < 4 && !peer; k++) {
-      code = newCode();
-      try { peer = await hostTransport(code, onHostConn); } catch (e) { if (!e.taken) throw e; }
+      code = (k === 0 && typeof forceCode === 'string' && /^[A-Z0-9]{5}$/.test(forceCode)) ? forceCode : newCode();
+      peer = await hostTransport(code, onHostConn);
+      if (!useBC) { await new Promise(r => setTimeout(r, 3300)); if (peer.foreign()) { peer.destroy(); peer = null; } else peer.stopWatch(); } // الكود مستخدم من غرفة أخرى؟
     }
     if (!peer) throw new Error('تعذّر إنشاء الغرفة');
     Object.assign(Net, { role: 'host', code, peer, conns: {}, mySeat: 0, seq: 0, inGame: false, wasHuman: {}, seatCids: [], status: '' });
@@ -542,8 +568,8 @@ function onHostMsg(conn, m) {
         S.log.push({ t: `${S.players[seat].name} عاد إلى اللعبة`, k: 'system', turn: S.turn });
         renderAll();
       }
-      conn.send({ t: 'start', state: S, seat, seq: Net.seq, speed: ui.speed });
-      broadcastState(false); Snd.play('join');
+      conn.send({ t: 'start', state: wireState(), seat, seq: Net.seq, speed: ui.speed });
+      if (!S.players[seat].isAI) broadcastState(false);
       return;
     }
     let seat = Net.seats.find(s => s.cid === m.cid);
@@ -557,10 +583,14 @@ function onHostMsg(conn, m) {
   } else if (m.t === 'profile' && !Net.inGame) {
     const seat = Net.seats.find(s => s.cid === conn.cid); if (!seat) return;
     Object.assign(seat, cleanProfile(m)); fixDupes(seat); renderLobby(); broadcastLobby();
+  } else if (m.t === 'sync' && Net.inGame && S) {
+    conn.send({ t: 'sync', state: wireState(), seq: Net.seq });
   } else if (m.t === 'move' && Net.inGame && S && m.move && typeof m.move.type === 'string') {
     const seat = Net.seatCids.indexOf(conn.cid); if (seat < 0) return;
+    // كل حركة مرتبطة برقم الحالة التي رآها الضيف: تكرار الرسالة أو حركة على حالة قديمة لا تُطبَّق مرتين
+    if (typeof m.seq === 'number' && m.seq !== Net.seq) { conn.send({ t: 'sync', state: wireState(), seq: Net.seq }); return; }
     const r = performMove(Object.assign({}, m.move, { by: seat }));
-    if (!r.success) conn.send({ t: 'error', msg: r.error });
+    if (!r.success) conn.send({ t: 'error', msg: r.error, seq: Net.seq });
   }
 }
 function onHostClose(conn) {
@@ -581,6 +611,7 @@ function onHostClose(conn) {
   }
 }
 async function joinRoom(code) {
+  await cidReady;
   code = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   if (code.length !== 5) { toast('اكتب كود الغرفة المكوّن من 5 خانات'); return; }
   if (Net.busy) return;
@@ -590,6 +621,7 @@ async function joinRoom(code) {
     Object.assign(Net, { role: 'guest', code, host: conn, snapshot: null, mySeat: null, status: 'متصل — بانتظار المضيف ليبدأ اللعبة' });
     try { sessionStorage.setItem(GUEST_KEY, code); } catch (e) { /* */ }
     conn.on('data', onGuestMsg);
+    conn.on('hb', d => { if (S && Net.inGame && typeof d.seq === 'number' && d.seq > Net.seq) conn.send({ t: 'sync' }); }); // فاتتنا رسالة؟ نطلب الحالة
     conn.on('reconnect', () => { if (Net.host === conn) { conn.send(helloMsg()); toast('عاد الاتصال ✓', 1800); } });
     conn.on('status', s => {
       if (Net.host !== conn) return;
@@ -612,21 +644,38 @@ async function joinRoom(code) {
 function onGuestMsg(m) {
   if (!m || typeof m.t !== 'string') return;
   if (m.t === 'who') { Net.host && Net.host.send(helloMsg()); return; }
+  if (m.t === 'sync') { if (!S || typeof m.seq !== 'number') return; clearMoveRetry(); Net.seq = m.seq; applyRemote(m.state, false); return; }
   if (m.t === 'lobby') {
     Net.snapshot = m.lobby; Net.mySeat = m.lobby.players.findIndex(p => p.cid === Net.cid);
     if (S) { S = null; Net.inGame = false; closeModal(true); $('#game').classList.add('hidden'); $('#lobby').classList.remove('hidden'); }
     renderLobby();
   } else if (m.t === 'start') {
+    clearMoveRetry();
+    const resume = !!S && Net.inGame && Net.mySeat === m.seat && S.config && m.state.config && S.config.map === m.state.config.map;
     Net.mySeat = m.seat; Net.seq = m.seq; Net.inGame = true; ui.speed = m.speed || 'normal'; ui.netWait = false;
-    S = m.state; enterGame(); Snd.play('turn');
+    if (resume) applyRemote(m.state, false); else { S = m.state; enterGame(); Snd.play('turn'); }
   } else if (m.t === 'state') {
-    if (!S || m.seq <= Net.seq) return; Net.seq = m.seq; applyRemote(m.state, m.anim);
+    if (!S || m.seq <= Net.seq) return;
+    const skipped = m.seq > Net.seq + 1; clearMoveRetry(); Net.seq = m.seq; applyRemote(m.state, m.anim && !skipped);
   } else if (m.t === 'error') {
-    toast(m.msg, 3500); ui.netWait = false; if (S) renderTurn();
+    clearMoveRetry(); toast(m.msg, 3500); ui.netWait = false; if (S) renderTurn();
     if (m.fatal) { leaveRoom(true); Net.status = m.msg; renderLobby(); }
   } else if (m.t === 'end') {
     toast('أغلق المضيف الغرفة', 3500); leaveRoom(true); if (S) showLobby(); else renderLobby();
   }
+}
+/* إرسال الحركة مع إعادة المحاولة إن ضاعت الرسالة (المضيف يرفض التكرار برقم الحالة) */
+let moveRetry = null;
+function clearMoveRetry() { if (moveRetry) { clearInterval(moveRetry.t); moveRetry = null; } }
+function sendMoveWithRetry(msg) {
+  clearMoveRetry();
+  const host = Net.host; host.send(msg);
+  let n = 0;
+  moveRetry = { t: setInterval(() => {
+    if (!isGuest() || Net.host !== host || Net.seq !== msg.seq) { clearMoveRetry(); return; }
+    if (++n > 4) { clearMoveRetry(); ui.netWait = false; if (S) renderTurn(); toast('لم تصل الحركة — تحقق من الاتصال وحاول مجدداً', 3000); return; }
+    host.send(msg);
+  }, 2500) };
 }
 function applyRemote(ns, anim) {
   ui.netWait = false;
@@ -783,7 +832,7 @@ function lobbyStart() {
   const players = list.map(p => ({ name: p.name, isAI: !!p.isAI, token: p.token, color: p.color, team: lobby.teams.on ? p.team % lobby.teams.n : undefined }));
   if (isHost()) { Net.seatCids = Net.seats.map(s => s.cid || null); Net.inGame = true; Net.wasHuman = {}; }
   startGame({ players, startCash: lobby.cash, speed: lobby.speed, map: lobby.map, rules: Object.assign({}, lobby.rules) });
-  if (isHost()) Object.values(Net.conns).forEach(c => { const seat = Net.seatCids.indexOf(c.cid); if (seat >= 0) c.send({ t: 'start', state: S, seat, seq: Net.seq, speed: ui.speed }); });
+  if (isHost()) Object.values(Net.conns).forEach(c => { const seat = Net.seatCids.indexOf(c.cid); if (seat >= 0) c.send({ t: 'start', state: wireState(), seat, seq: Net.seq, speed: ui.speed }); });
   saveHostSession();
 }
 function showLobby() {
@@ -1477,8 +1526,7 @@ function performMove(move) {
     const err = E.validateMove(S, Object.assign({}, move, { by: Net.mySeat }));
     if (err) { Snd.play('error'); return { success: false, error: err, state: viewText() }; }
     if (ui.netWait) return { success: false, error: 'بانتظار المضيف…' };
-    ui.netWait = true; Net.host.send({ t: 'move', move }); renderTurn();
-    setTimeout(() => { if (ui.netWait) { ui.netWait = false; if (S) renderTurn(); } }, 8000);
+    ui.netWait = true; sendMoveWithRetry({ t: 'move', move, seq: Net.seq }); renderTurn();
     return { success: true, state: viewText() };
   }
   const err = E.validateMove(S, move);
@@ -1550,12 +1598,7 @@ function enterGame() {
 }
 function renderSoundBtn() { $('#sound-btn').innerHTML = svg(Snd.on ? ICON.soundOn : ICON.soundOff); }
 
-function init() {
-  buildBoard();
-  renderLobby();
-  $('#start-btn').addEventListener('click', lobbyStart);
-  $('#leave-btn').addEventListener('click', () => { leaveRoom(); renderLobby(); });
-  const qRoom = (location.search.match(/[?&]room=([A-Za-z0-9]{5})/) || [])[1];
+function resumeFromUrl(qRoom) {
   let hostSess = null, guestRoom = null;
   try { hostSess = JSON.parse(sessionStorage.getItem(HOST_KEY)); guestRoom = sessionStorage.getItem(GUEST_KEY); } catch (e) { /* */ }
   if (qRoom && hostSess && hostSess.code === qRoom.toUpperCase()) resumeHost(hostSess); // المضيف أعاد تحميل الصفحة
@@ -1564,6 +1607,14 @@ function init() {
     if (guestRoom === lobby.joinCode) joinRoom(lobby.joinCode); // الضيف أعاد تحميل الصفحة: انضمام تلقائي لمقعده
     else { toast('اكتب اسمك واختر قطعتك ثم اضغط «انضم»', 4000); setTimeout(() => { const i = $('[data-player-config="0"] input'); i && i.focus(); }, 50); }
   }
+}
+function init() {
+  buildBoard();
+  renderLobby();
+  $('#start-btn').addEventListener('click', lobbyStart);
+  $('#leave-btn').addEventListener('click', () => { leaveRoom(); renderLobby(); });
+  const qRoom = (location.search.match(/[?&]room=([A-Za-z0-9]{5})/) || [])[1];
+  if (qRoom) cidReady.then(() => resumeFromUrl(qRoom));
   $('#resume-btn').addEventListener('click', () => {
     const d = loadSave(); if (!d) return;
     Snd.init(); S = d.state; ui.speed = d.speed || 'normal'; Snd.on = d.sound !== false;
