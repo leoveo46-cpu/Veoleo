@@ -150,6 +150,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const hv = await play(400, v => v.turn >= hv0.turn + 6);
     ok(hv.turn >= hv0.turn + 6, 'progressed after reconnect'); await synced();
   });
+  await test('اتصال يموت بصمت (هاتف نام): يُكتشف ويُعاد تلقائياً، واللاعب يعود لمقعده', async () => {
+    B.freezeAll(); // ضيف1 لا يصل إلا للخادم B
+    await host.waitForFunction(() => JSON.parse(render_game_to_text()).players[1].isAI === true, null, { timeout: 45000 });
+    await g1.evaluate(() => { document.dispatchEvent(new Event('visibilitychange')); }); // الهاتف عاد للواجهة
+    await host.waitForFunction(() => JSON.parse(render_game_to_text()).players[1].isAI === false, null, { timeout: 45000 });
+    const hv0 = await view(host);
+    const hv = await play(400, v => v.turn >= hv0.turn + 4);
+    ok(hv.turn >= hv0.turn + 4, 'progressed'); await synced();
+  });
   await test('توقف الخادم A نهائياً: الضيف2 ينتقل تلقائياً للخادم B', async () => {
     await A.close();
     await sleep(14000);
@@ -175,7 +184,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const hv = await play(300, v => v.turn >= before.turn + 4); ok(hv.turn >= before.turn + 4, 'continues'); await synced();
   });
   await test('المباراة تكتمل حتى الفوز ويرى الجميع النتيجة', async () => {
-    const hv = await play(8000);
+    let hv = await view(host), lastTurn = hv.turn, stuckSince = Date.now(); const end = Date.now() + 25 * 60000;
+    while (hv.phase !== 'gameOver' && Date.now() < end) {
+      hv = await play(400, v => v.turn >= lastTurn + 10);
+      if (hv.turn > lastTurn) { lastTurn = hv.turn; stuckSince = Date.now(); } else ok(Date.now() - stuckSince < 60000, `stuck at turn ${hv.turn} phase ${hv.turnPhase} actor ${hv.actor}`);
+    }
     eq(hv.phase, 'gameOver');
     for (const g of [g1, g2]) await g.waitForFunction(() => JSON.parse(render_game_to_text()).phase === 'gameOver', null, { timeout: 10000 });
     console.log('     • الأدوار:', hv.turn, '— متوسط زمن الحركة حتى تصل للمضيف:', Math.round(stats.ms / stats.moves), 'ms عبر', stats.moves, 'حركة');
