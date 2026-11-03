@@ -315,9 +315,18 @@ class Mqtt {
       };
     });
   }
+  /* اتصال ميت بصمت لا يُطلق onclose (لا يصل رد الإغلاق أبداً): نتخلى عنه فوراً ونفتح اتصالاً جديداً */
+  dropSocket() {
+    const ws = this.ws; if (!ws) return;
+    ws.onclose = ws.onmessage = ws.onerror = ws.onopen = null;
+    try { ws.close(); } catch (e) { /* */ }
+    const was = this.connected; this.connected = false; clearInterval(this.pingT);
+    if (was) this.emit('offline');
+    if (!this.closed) { clearTimeout(this.rT); this.rT = null; this.retry = 0; this.reconnectLater(); }
+  }
   kick() { // الهاتف أيقظ الصفحة: الاتصال قد يكون ميتاً بصمت — نعيد فتحه فوراً
     if (this.closed) return;
-    if (this.connected) { try { this.ws.close(); } catch (e) { /* */ } return; }
+    if (this.connected) { this.dropSocket(); return; }
     clearTimeout(this.rT); this.rT = null; this.retry = 0; this.connect().catch(() => this.reconnectLater());
   }
   reconnectLater() {
@@ -352,7 +361,7 @@ class Mqtt {
           // نبض كل 10 ث؛ إن لم يصل أي رد خلال 25 ث فالاتصال ميت بصمت (هاتف نام، شبكة تغيّرت) — نغلقه ونعيد الاتصال
           clearInterval(this.pingT); this.lastRx = Date.now();
           this.pingT = setInterval(() => {
-            if (Date.now() - this.lastRx > 25000) { try { this.ws.close(); } catch (e) { /* */ } return; }
+            if (Date.now() - this.lastRx > 25000) { this.dropSocket(); return; }
             try { this.ws.send(new Uint8Array([0xC0, 0])); } catch (e) { /* */ }
           }, 10000);
           const q = this.q; this.q = []; q.forEach(([tp, pl]) => this.publish(tp, pl));

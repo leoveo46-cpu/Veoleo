@@ -152,9 +152,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   });
   await test('اتصال يموت بصمت (هاتف نام): يُكتشف ويُعاد تلقائياً، واللاعب يعود لمقعده', async () => {
     B.freezeAll(); // ضيف1 لا يصل إلا للخادم B
-    await host.waitForFunction(() => JSON.parse(render_game_to_text()).players[1].isAI === true, null, { timeout: 45000 });
+    await host.waitForFunction(() => JSON.parse(render_game_to_text()).players[1].isAI === true, null, { timeout: 45000 }).catch(() => { throw new Error('host did not notice silent guest'); });
     await g1.evaluate(() => { document.dispatchEvent(new Event('visibilitychange')); }); // الهاتف عاد للواجهة
-    await host.waitForFunction(() => JSON.parse(render_game_to_text()).players[1].isAI === false, null, { timeout: 45000 });
+    await host.waitForFunction(() => JSON.parse(render_game_to_text()).players[1].isAI === false, null, { timeout: 45000 }).catch(() => { throw new Error('guest did not come back'); });
     const hv0 = await view(host);
     const hv = await play(400, v => v.turn >= hv0.turn + 4);
     ok(hv.turn >= hv0.turn + 4, 'progressed'); await synced();
