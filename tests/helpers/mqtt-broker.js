@@ -13,7 +13,7 @@ function startBroker(port) {
     sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acc}\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n`);
     const c = { sock, subs: new Set(), will: null, wsbuf: Buffer.alloc(0), mq: Buffer.alloc(0), alive: true };
     clients.add(c);
-    const send = b => { try { sock.write(frame(b)); } catch (e) { /* */ } };
+    const send = b => { if (c.frozen) return; try { sock.write(frame(b)); } catch (e) { /* */ } };
     c.send = send;
     const gone = graceful => { if (!c.alive) return; c.alive = false; clients.delete(c); if (!graceful && c.will) route(c.will.topic, c.will.payload); try { sock.destroy(); } catch (e) { /* */ } };
     const handle = () => {
@@ -32,6 +32,7 @@ function startBroker(port) {
       }
     };
     sock.on('data', chunk => {
+      if (c.frozen) return; // اتصال «ميت بصمت»: لا شيء يمر ولا يُغلق
       c.wsbuf = Buffer.concat([c.wsbuf, chunk]);
       for (;;) {
         const b = c.wsbuf; if (b.length < 2) return;
@@ -50,6 +51,7 @@ function startBroker(port) {
   function route(topic, payload) { const out = pkt(0x30, Buffer.concat([Buffer.from([topic.length >> 8, topic.length & 255]), Buffer.from(topic), payload])); clients.forEach(c => { if (c.subs.has(topic)) c.send(out); }); }
   return new Promise(res => server.listen(port || 0, '127.0.0.1', () => res({ port: server.address().port,
     dropNext(n, re) { drop.n = n; drop.re = re; },
+    freezeAll() { clients.forEach(c => { c.frozen = true; }); },
     dropAll() { clients.forEach(c => { try { c.sock.destroy(); } catch (e) { /* */ } }); },
     close() { clients.forEach(c => { try { c.sock.destroy(); } catch (e) { /* */ } }); return new Promise(r => server.close(r)); }, count: () => clients.size })));
 }
