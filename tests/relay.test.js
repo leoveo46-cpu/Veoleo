@@ -61,10 +61,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await host.waitForFunction(() => window.__net.state().seats === 5, null, { timeout: 15000 });
     for (const g of [g1, g2, g3, g4]) await g.waitForFunction(() => window.__net.state().seats === 5, null, { timeout: 10000 });
     const rows = await host.evaluate(() => [...document.querySelectorAll('[data-player-config]')].map(r => [r.querySelector('input').value, r.querySelector('.token-btn').getAttribute('aria-label'), r.querySelector('.color-btn').getAttribute('style')]));
-    eq(rows.map(r => r[0]), ['المضيف', 'ضيف1', 'ضيف2', 'ضيف3', 'ضيف4']);
+    eq(rows.map(r => r[0]).slice(0, 3), ['المضيف', 'ضيف1', 'ضيف2']);
+    eq(rows.map(r => r[0]).slice(3).sort(), ['ضيف3', 'ضيف4'], 'both simultaneous joiners present (any order)');
     eq(new Set(rows.map(r => r[1])).size, 5, 'unique tokens'); eq(new Set(rows.map(r => r[2])).size, 5, 'unique colors');
     const seatsSeen = await Promise.all([g1, g2, g3, g4].map(g => net(g).then(n => n.mySeat)));
-    eq(seatsSeen, [1, 2, 3, 4], 'each guest sees own seat');
+    eq(seatsSeen.slice(0, 2), [1, 2]); eq(seatsSeen.slice(2).sort(), [3, 4], 'each guest sees its own distinct seat');
+    const nameAt = await host.evaluate(() => [...document.querySelectorAll('[data-player-config] input')].map(i => i.value));
+    eq(nameAt[seatsSeen[2]], 'ضيف3'); eq(nameAt[seatsSeen[3]], 'ضيف4');
   });
   await test('تبويب مكرر (نفس بيانات التبويب) لا يستولي على مقعد لاعب آخر', async () => {
     const cid2 = await g2.evaluate(() => sessionStorage.getItem('mono-cid'));
@@ -100,11 +103,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await host.evaluate(() => window.__ui.speed('instant'));
     await host.click('#start-btn');
     for (const g of [g1, g2, g3, g4]) await g.waitForSelector('[data-screen="game"]:not(.hidden)', { timeout: 10000 });
-    eq((await view(g1)).players.map(p => p.name), ['المضيف', 'ضيف1', 'ضيف2', 'ضيف3', 'ضيف4']);
+    eq((await view(g1)).players.map(p => p.name), (await view(host)).players.map(p => p.name));
+    eq((await view(g1)).players.length, 5);
     eq((await net(g1)).mySeat, 1); eq((await net(g2)).mySeat, 2);
   });
 
-  const pages = () => [host, g1, g2, g3, g4];
+  let seatPages = null;
+  const pages = () => seatPages;
   const stats = { moves: 0, ms: 0 };
   async function play(maxSteps, until) {
     const deadline = Date.now() + Math.min(480000, maxSteps * 150);
@@ -128,6 +133,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   const synced = async () => { await sleep(900); const hv = await view(host); for (const g of [g1, g2, g3, g4]) { const gv = await view(g); eq([gv.turn, gv.players.map(p => [p.cash, p.pos])], [hv.turn, hv.players.map(p => [p.cash, p.pos])], 'state sync'); } return hv; };
 
   await test('اللعب متزامن: النرد والحركة والأدوار عند الجميع', async () => {
+    seatPages = [host]; for (const g of [g1, g2, g3, g4]) seatPages[(await net(g)).mySeat] = g; // كل جهاز يلعب مقعده الحقيقي
     const hv0 = await view(host);
     const hv = await play(400, v => v.turn >= hv0.turn + 12);
     ok(hv.turn >= hv0.turn + 12, 'progressed'); await synced();
