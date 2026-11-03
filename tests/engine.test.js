@@ -142,10 +142,23 @@ test('دين يمكن سداده بالرهن', () => {
   eq(s.turnPhase, 'debt'); eq(E.getActor(s), 0); throws(() => mv(s, { type: 'payDebt' }), /أقل من الدين/);
   s = mv(s, { type: 'mortgage', sq: 37 }); s = mv(s, { type: 'payDebt' }); eq(s.players[0].cash, 10 + 175 - 50); eq(s.turnPhase, 'preRoll'); // دبل -> رمية أخرى
 });
-test('الإفلاس لصالح لاعب ينقل الأصول', () => {
-  let s = own(game(3), 1, 37, 39); s.props[39].houses = 5; own(s, 0, 1); s.players[0].cash = 100; s.players[0].goojf = ['chest']; s.players[0].pos = 30; s = roll(s, 4, 5);
-  eq(s.turnPhase, 'debt'); s = mv(s, { type: 'bankrupt' });
-  eq(s.players[0].bankrupt, true); eq(s.props[1].owner, 1); eq(s.players[1].goojf, ['chest']); eq(s.current, 1); eq(s.phase, 'playing');
+test('الإفلاس لصالح لاعب: يأخذ النقد فقط، والعقارات تعود للبنك', () => {
+  let s = own(game(3), 1, 37, 39); s.props[39].houses = 5; own(s, 0, 1, 3); s.props[1].houses = 1; s.props[3].houses = 1; s.players[0].cash = 100; s.players[0].goojf = ['chest']; s.players[0].pos = 30; s = roll(s, 4, 5);
+  eq(s.turnPhase, 'debt'); const before = s.players[1].cash; s = mv(s, { type: 'bankrupt' });
+  eq(s.players[0].bankrupt, true); eq(s.props[1].owner, null); eq(s.props[3].owner, null); eq(s.props[1].houses, 0);
+  eq(s.players[1].goojf, []); ok(s.decks.chest.includes('h5'), 'card back to deck'); eq(s.players[1].cash, before + 150, 'cash 100 + houses 50');
+  eq(s.current, 1); eq(s.phase, 'playing');
+});
+test('عشوائية حقيقية: نفس الحالة مع مصادر مختلفة تعطي نرداً مختلفاً، ونفس المصدر يعطي نفس النتيجة', () => {
+  const base = game(2); const seen = new Set();
+  for (let k = 0; k < 60; k++) { const s = mv(base, { type: 'roll', entropy: (k * 2654435761) | 0 }); seen.add(s.dice.join()); }
+  ok(seen.size >= 15, 'varied dice ' + seen.size);
+  eq(mv(base, { type: 'roll', entropy: 12345 }).dice, mv(base, { type: 'roll', entropy: 12345 }).dice, 'deterministic');
+});
+test('توزيع النرد متوازن (60000 رمية)', () => {
+  const c = [0, 0, 0, 0, 0, 0, 0]; let s = game(2); s.players[0].pos = 20;
+  for (let k = 0; k < 30000; k++) { const t = mv(s, { type: 'roll', entropy: (Math.random() * 2 ** 31) | 0 }); c[t.dice[0]]++; c[t.dice[1]]++; }
+  for (let f = 1; f <= 6; f++) ok(Math.abs(c[f] / 60000 - 1 / 6) < 0.01, `face ${f}: ${c[f]}`);
 });
 test('الإفلاس للبنك يعيد العقارات', () => { let s = own(game(3), 0, 1); s.players[0].cash = 50; s = roll(s, 1, 3); s = mv(s, { type: 'bankrupt' }); eq(s.props[1].owner, null); eq(s.players[0].bankrupt, true); });
 test('آخر لاعب متبقٍّ يفوز', () => { let s = own(game(2), 1, 39); s.players[0].cash = 10; s.players[0].pos = 37; s = roll(s, 1, 1); s = mv(s, { type: 'bankrupt' }); eq(s.phase, 'gameOver'); eq(s.winner, 1); throws(() => mv(s, { type: 'roll' }), /انتهت/); });

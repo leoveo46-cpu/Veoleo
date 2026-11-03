@@ -289,6 +289,11 @@ function rand(state) { // mulberry32 — البذرة جزء من الحالة
   t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
+function mixSeed(seed, e) { // خلط بذرة بمصدر عشوائي خارجي (murmur3 finalizer)
+  let h = (seed ^ Math.imul(e | 0, 0x9E3779B1)) | 0;
+  h = Math.imul(h ^ (h >>> 16), 0x85EBCA6B); h = Math.imul(h ^ (h >>> 13), 0xC2B2AE35);
+  return (h ^ (h >>> 16)) | 0;
+}
 const rollDie = s => 1 + Math.floor(rand(s) * 6);
 function shuffle(state, arr) {
   for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rand(state) * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; }
@@ -676,23 +681,16 @@ function bankrupt(state, debt) {
     if (pr.houses === C.HOTEL_LEVEL) state.bank.hotels++; else state.bank.houses += pr.houses;
     p.cash += pr.houses * SQUARES[i].house / 2; pr.houses = 0;
   });
-  if (toPlayer) {
+  // عقارات المفلس لا تنتقل لأي لاعب: تعود كلها للبنك متاحة للشراء من جديد.
+  // الدائن (إن كان لاعباً) يأخذ ما تبقى من نقد المفلس فقط.
+  if (toPlayer && p.cash > 0) {
     const cr = pl(state, debt.creditor);
     cr.cash += p.cash;
-    ev(state, { type: 'money', player: cr.id, delta: p.cash, reason: 'أصول مفلس' });
-    OWNABLE.forEach(i => {
-      const pr = state.props[i];
-      if (pr.owner !== p.id) return;
-      pr.owner = cr.id;
-      if (pr.mortgaged) { const f = Math.min(mortgageFee(i), cr.cash); cr.cash -= f; }
-    });
-    cr.goojf.push(...p.goojf);
-    log(state, `💥 ${p.name} أفلس! انتقلت كل أصوله إلى ${cr.name}`, 'bankrupt');
-  } else {
-    OWNABLE.forEach(i => { const pr = state.props[i]; if (pr.owner === p.id) { pr.owner = null; pr.mortgaged = false; } });
-    p.goojf.forEach(d => { const id = CARDS[d].find(c => c.a.k === 'goojf').id; state.decks[d].push(id); });
-    log(state, `💥 ${p.name} أفلس! عادت عقاراته إلى البنك`, 'bankrupt');
+    ev(state, { type: 'money', player: cr.id, delta: p.cash, reason: 'نقد مفلس' });
   }
+  OWNABLE.forEach(i => { const pr = state.props[i]; if (pr.owner === p.id) { pr.owner = null; pr.mortgaged = false; pr.houses = 0; } });
+  p.goojf.forEach(d => { const id = CARDS[d].find(c => c.a.k === 'goojf').id; state.decks[d].push(id); });
+  log(state, toPlayer ? `💥 ${p.name} أفلس! أخذ ${pl(state, debt.creditor).name} ما تبقى من نقده، وعادت عقاراته إلى البنك` : `💥 ${p.name} أفلس! عادت عقاراته إلى البنك`, 'bankrupt');
   p.goojf = []; p.cash = 0; p.bankrupt = true; p.inJail = false;
   ev(state, { type: 'bankrupt', player: p.id });
   // ديون أخرى على اللاعب المفلس تُلغى، وديون له تذهب للبنك
@@ -840,6 +838,9 @@ function applyMove(prev, move) {
   if (err) throw new Error(err);
   const state = clone(prev);
   state.events = []; state.lastCard = null;
+  // عشوائية حقيقية: الواجهة (أو المضيف) تضيف لكل حركة رقماً من مولّد التشفير في المتصفح ويُمزج في البذرة.
+  // المحرك يبقى نقياً: نفس الحالة + نفس الحركة = نفس النتيجة.
+  if (Number.isInteger(move.entropy)) state.seed = mixSeed(state.seed, move.entropy);
   const actor = getActor(state);
   const p = pl(state, actor);
   switch (move.type) {

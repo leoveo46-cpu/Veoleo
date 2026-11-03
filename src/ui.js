@@ -125,6 +125,9 @@ const ART_BY_GROUP = { br: 'christ', il: 'dome', in: 'taj', it: 'colosseum', de:
   brown: 'palm', lightblue: 'houses', pink: 'arch', orange: 'fountain', red: 'waves', yellow: 'tower', green: 'island', darkblue: 'palace' };
 const ART_BY_NAME = { 'باريس': 'eiffel', 'لندن': 'bigben', 'نيويورك': 'liberty', 'سان فرانسيسكو': 'bridge', 'البندقية': 'gondola', 'طوكيو': 'fuji', 'يوكوهاما': 'pagoda' };
 const artEl = sq => { const k = ART_BY_NAME[sq.name] || ART_BY_GROUP[sq.group]; return k ? h('div', { class: 'art', style: `color:${GROUPS[sq.group].color}`, html: `<svg viewBox="0 0 40 40">${ART[k]}</svg>` }) : null; };
+/* رسوم المباني: بيت أخضر بسقف داكن ونافذة، وفندق عنابي بنوافذ مضيئة */
+const HOUSE_SVG = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 1.6L.8 9.4h2.6v9h13.2v-9h2.6z" fill="var(--house-c)"/><path d="M10 1.6L.8 9.4h2.6L10 3.9l6.6 5.5h2.6z" fill="var(--house-roof)"/><rect x="13.2" y="3.4" width="2" height="3.6" fill="var(--house-roof)"/><rect x="8.2" y="12.2" width="3.6" height="6.2" rx=".6" fill="#fff8ec"/></svg>';
+const HOTEL_SVG = '<svg viewBox="0 0 30 20" aria-hidden="true"><path d="M2.5 6.5L15 1.2l12.5 5.3z" fill="var(--hotel-roof)"/><rect x="3" y="6.3" width="24" height="13.2" rx="1.2" fill="var(--hotel-c)"/><g fill="#ffe3a3"><rect x="5.5" y="8.6" width="3" height="2.6" rx=".4"/><rect x="10.5" y="8.6" width="3" height="2.6" rx=".4"/><rect x="16.5" y="8.6" width="3" height="2.6" rx=".4"/><rect x="21.5" y="8.6" width="3" height="2.6" rx=".4"/><rect x="5.5" y="13" width="3" height="2.6" rx=".4"/><rect x="21.5" y="13" width="3" height="2.6" rx=".4"/></g><rect x="12.6" y="13.4" width="4.8" height="6.1" rx=".6" fill="#fff8ec"/></svg>';
 const MAP_ICON = { castle: '🏰', city: '🏙️', globe: '🌍', clover: '🍀' };
 
 /* ---------- الصوت (Web Audio — بلا ملفات): أصوات خشبية وأجراس ناعمة ---------- */
@@ -135,10 +138,12 @@ const Snd = {
     try {
       const c = this.ctx = new (window.AudioContext || window.webkitAudioContext)();
       const comp = c.createDynamicsCompressor(); comp.threshold.value = -16; comp.ratio.value = 4;
-      const master = c.createGain(); master.gain.value = 0.9;
+      const master = c.createGain(); master.gain.value = 0.42;
+      const soft = c.createBiquadFilter(); soft.type = 'lowpass'; soft.frequency.value = 3200; soft.Q.value = 0.5; // يزيل الحدة
+      soft.connect(comp);
       // صدى خفيف لإحساس الغرفة
       const dl = c.createDelay(); dl.delayTime.value = 0.11; const fb = c.createGain(); fb.gain.value = 0.18; const wet = c.createGain(); wet.gain.value = 0.16;
-      master.connect(comp); master.connect(dl); dl.connect(fb).connect(dl); dl.connect(wet).connect(comp); comp.connect(c.destination);
+      master.connect(soft); master.connect(dl); dl.connect(fb).connect(dl); dl.connect(wet).connect(soft); comp.connect(c.destination);
       this.out = master;
     } catch (e) { this.on = false; }
   },
@@ -164,30 +169,33 @@ const Snd = {
     if (this.ctx.state === 'suspended') this.ctx.resume();
     const C5 = 523.25, E5 = 659.25, G5 = 783.99, A5 = 880, C6 = 1046.5, D5 = 587.33, G4 = 392, E4 = 329.63, C4 = 261.63, A4 = 440, F4 = 349.23;
     switch (name) {
-      case 'dice': for (let i = 0; i < 9; i++) this.wood(700 + Math.random() * 900, i * 0.055 + Math.random() * 0.02, 0.12 + Math.random() * 0.08); this.wood(500, 0.58, 0.25); this.wood(620, 0.66, 0.16); break;
-      case 'step': this.wood(1100 + Math.random() * 120, 0, 0.09); break;
-      case 'coin': this.bell(1568, 0, 0.09, 0.5); this.bell(2093, 0.07, 0.09, 0.7); break;
-      case 'pay': this.mallet(G4, 0, 0.15); this.mallet(E4, 0.1, 0.15); this.mallet(C4, 0.2, 0.13); break;
-      case 'card': this.noise(0.35, 0.22, 1200, 0, 0.7, 'highpass', 5000); this.bell(E5, 0.18, 0.07, 0.6); break;
-      case 'jail': this.bell(110, 0, 0.22, 1.6); this.noise(0.12, 0.35, 3000, 0, 6); this.noise(0.12, 0.3, 2600, 0.14, 6); break;
-      case 'buy': [C5, E5, G5, C6].forEach((f, i) => this.mallet(f, i * 0.075, 0.16)); this.bell(C6 * 2, 0.32, 0.05, 0.6); break;
-      case 'build': this.wood(300, 0, 0.3); this.wood(340, 0.13, 0.28); this.wood(420, 0.26, 0.22); break;
-      case 'rent': this.mallet(A4, 0, 0.14); this.mallet(F4, 0.12, 0.14); break;
-      case 'turn': this.bell(G5, 0, 0.06, 0.6); this.bell(C6, 0.09, 0.06, 0.8); break;
-      case 'bid': this.mallet(A5, 0, 0.12); break;
-      case 'hammer': this.wood(220, 0, 0.4); this.noise(0.08, 0.4, 700, 0, 2); this.wood(200, 0.16, 0.3); break;
-      case 'error': this.osc('triangle', 200, this.ctx.currentTime, 0.005, 0.18, 0.08, 150); this.osc('triangle', 150, this.ctx.currentTime + 0.1, 0.005, 0.2, 0.08, 110); break;
-      case 'click': this.wood(1600, 0, 0.06); break;
-      case 'bankrupt': [G4, F4, E4, C4].forEach((f, i) => this.mallet(f * 0.5, i * 0.22, 0.2)); this.bell(65, 0.9, 0.15, 1.5); break;
-      case 'win': [C5, E5, G5, C6, G5, C6, E5 * 2].forEach((f, i) => this.mallet(f, i * 0.12, 0.17)); [C5, E5, G5].forEach(f => this.bell(f, 0.9, 0.06, 1.6)); break;
-      case 'join': this.bell(D5, 0, 0.07, 0.5); this.bell(A5, 0.08, 0.07, 0.7); break;
+      case 'dice': for (let i = 0; i < 6; i++) this.wood(520 + Math.random() * 380, i * 0.07 + Math.random() * 0.025, 0.06 + Math.random() * 0.04); this.wood(420, 0.5, 0.12); break;
+      case 'step': this.osc('sine', 760 + Math.random() * 60, this.ctx.currentTime, 0.004, 0.07, 0.035, 640); break;
+      case 'coin': this.bell(1046.5, 0, 0.05, 0.55); this.bell(1318.5, 0.08, 0.045, 0.8); break;
+      case 'pay': this.mallet(G4, 0, 0.09); this.mallet(E4, 0.11, 0.08); break;
+      case 'card': this.noise(0.3, 0.07, 900, 0, 0.6, 'bandpass', 2200); this.bell(E5, 0.16, 0.05, 0.7); break;
+      case 'jail': this.bell(146.8, 0, 0.12, 1.2); this.bell(110, 0.18, 0.1, 1.4); break;
+      case 'buy': [C5, E5, G5, C6].forEach((f, i) => this.mallet(f, i * 0.085, 0.1)); this.bell(C6, 0.36, 0.04, 0.9); break;
+      case 'build': this.wood(330, 0, 0.13); this.wood(392, 0.12, 0.11); this.bell(G5, 0.24, 0.035, 0.6); break;
+      case 'rent': this.mallet(A4, 0, 0.09); this.mallet(F4, 0.13, 0.08); break;
+      case 'turn': this.bell(G5, 0, 0.035, 0.6); this.bell(C6, 0.1, 0.035, 0.9); break;
+      case 'bid': this.mallet(A5, 0, 0.07); break;
+      case 'hammer': this.wood(260, 0, 0.18); this.wood(240, 0.15, 0.12); break;
+      case 'error': this.osc('sine', 330, this.ctx.currentTime, 0.01, 0.16, 0.05, 260); break;
+      case 'click': this.osc('sine', 1180, this.ctx.currentTime, 0.002, 0.035, 0.025); break;
+      case 'bankrupt': [G4, F4, E4, C4].forEach((f, i) => this.mallet(f, i * 0.24, 0.09)); break;
+      case 'win': [C5, E5, G5, C6, G5, C6].forEach((f, i) => this.mallet(f, i * 0.13, 0.1)); [C5, E5, G5].forEach(f => this.bell(f, 0.85, 0.035, 1.8)); break;
+      case 'join': this.bell(D5, 0, 0.045, 0.5); this.bell(A5, 0.09, 0.045, 0.7); break;
     }
   },
 };
 
+/* ---------- عشوائية آمنة من المتصفح (crypto) لكل حركة ---------- */
+const cryptoInt = () => { try { const a = new Uint32Array(1); crypto.getRandomValues(a); return a[0] | 0; } catch (e) { return (Math.random() * 4294967296) | 0; } };
+
 /* ---------- حالة الواجهة ---------- */
 let S = null;                               // الحالة الوحيدة للعبة
-const SPEEDS = { normal: { step: 190, dice: 1050, ai: 750, card: 2300 }, fast: { step: 90, dice: 600, ai: 300, card: 1300 }, instant: { step: 0, dice: 0, ai: 0, card: 0 } };
+const SPEEDS = { normal: { step: 135, dice: 820, ai: 600, card: 2100 }, fast: { step: 70, dice: 520, ai: 260, card: 1200 }, instant: { step: 0, dice: 0, ai: 0, card: 0 } };
 const ui = { speed: 'normal', netWait: false, pending: 0, queue: Promise.resolve(), aiTimer: null, modal: null, tokenPos: {}, displayCash: null, spin: [0, 0], cardOpen: false, msg: '' };
 const SAVE_KEY = 'monopoly-save-v2';
 const sp = () => SPEEDS[ui.speed];
@@ -1016,8 +1024,8 @@ function renderBoardState() {
     if (bar) {
       bar.innerHTML = '';
       bar.classList.toggle('has-b', pr.houses > 0);
-      if (pr.houses === C.HOTEL_LEVEL) bar.append(h('span', { class: 'hotel' }));
-      else for (let k = 0; k < pr.houses; k++) bar.append(h('span', { class: 'house' }));
+      if (pr.houses === C.HOTEL_LEVEL) bar.append(h('span', { class: 'hotel', html: HOTEL_SVG, title: 'فندق' }));
+      else for (let k = 0; k < pr.houses; k++) bar.append(h('span', { class: 'house', html: HOUSE_SVG, title: `${pr.houses} بيت` }));
       cell.dataset.houses = pr.houses;
     }
   });
@@ -1487,15 +1495,8 @@ async function animate(events, prev) {
         break;
       case 'move':
         prevJail[e.player] = false;
-        for (const pos of e.path) {
-          setPos(e.player, pos);
-          if (!instant) {
-            const t = document.querySelector(`[data-token="${e.player}"]`);
-            t.style.transitionDuration = sp().step + 'ms';
-            t.classList.remove('hop'); void t.offsetWidth; t.classList.add('hop');
-            Snd.play('step'); await wait(sp().step);
-          }
-        }
+        if (instant || !e.path.length) { e.path.forEach(pos => setPos(e.player, pos)); break; }
+        await walkToken(e.player, e.path, prevJail);
         break;
       case 'jail':
         prevJail[e.player] = true; Snd.play('jail'); setPos(e.player, C.JAIL_POS);
@@ -1504,9 +1505,9 @@ async function animate(events, prev) {
       case 'land': flashCell(e.sq); break;
       case 'card': await showCard(e); break;
       case 'money':
+        const fromCash = ui.displayCash[e.player];
         ui.displayCash[e.player] += e.delta;
-        const cashEl = document.querySelector(`[data-cash="${e.player}"]`);
-        if (cashEl) cashEl.innerHTML = '', cashEl.append(M(ui.displayCash[e.player]));
+        tweenCash(document.querySelector(`[data-cash="${e.player}"]`), fromCash, ui.displayCash[e.player]);
         if (!instant) {
           floatMoney(e.player, e.delta);
           const now = Date.now();
@@ -1527,6 +1528,36 @@ async function animate(events, prev) {
   ui.displayCash = null; ui.tokenPos = {};
 }
 function isHumanTarget(prev) { return !!prev.trade && canControl(prev.trade.to); }
+/* مشي القطعة خانة خانة بحركة واحدة سلسة على كرت الشاشة (Web Animations) مع قفزة ناعمة لكل خطوة */
+async function walkToken(pid, path, jailMap) {
+  const t = document.querySelector(`[data-token="${pid}"]`), body = t && t.querySelector('.tb');
+  if (!t || !t.animate) { for (const pos of path) { ui.tokenPos[pid] = pos; placeTokensAnim(jailMap); await wait(sp().step); } return; }
+  const step = sp().step, p = S.players[pid];
+  const from = t.style.transform || 'none';
+  const pts = path.map(pos => { ui.tokenPos[pid] = pos; const { x, y } = tokenXYWith(Object.assign({}, p, { inJail: false }), pos, false, jailMap); return `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`; });
+  t.style.transition = 'none';
+  const frames = [{ transform: from }, ...pts.map(tr => ({ transform: tr }))].map((f, i, a) => Object.assign(f, { offset: i / (a.length - 1), easing: 'cubic-bezier(.33,0,.25,1)' }));
+  const walk = t.animate(frames, { duration: step * path.length, fill: 'forwards' });
+  const hop = body ? body.animate([{ transform: 'translateY(0) scale(1)' }, { transform: 'translateY(-34%) scale(1.06,.96)', offset: .45 }, { transform: 'translateY(0) scale(1.04,.94)', offset: .9 }, { transform: 'translateY(0) scale(1)' }], { duration: step, iterations: path.length, easing: 'ease-out' }) : null;
+  const ticks = path.map((_, k) => setTimeout(() => Snd.play('step'), step * (k + 1) - 20));
+  await walk.finished.catch(() => {});
+  ticks.forEach(clearTimeout); if (hop) hop.cancel();
+  t.style.transform = pts[pts.length - 1]; walk.cancel(); void t.offsetWidth; t.style.transition = '';
+  placeTokensAnim(jailMap);
+  landPulse(path[path.length - 1], p);
+}
+function landPulse(sq, p) {
+  const cell = document.querySelector(`.cell[data-sq="${sq}"]`); if (!cell || !cell.animate) return;
+  cell.animate([{ boxShadow: `inset 0 0 0 0 transparent` }, { boxShadow: `inset 0 0 0 3px ${getComputedStyle(document.documentElement).getPropertyValue('--color-player-' + (p.color % COLORS)).trim() || '#590907'}` }, { boxShadow: 'inset 0 0 0 0 transparent' }], { duration: 650, easing: 'ease-out' });
+}
+/* عداد المال يتحرك بنعومة بدل القفز */
+function tweenCash(el, from, to) {
+  if (!el) return;
+  if (ui.speed === 'instant' || from === to) { el.replaceChildren(M(to)); return; }
+  const t0 = performance.now(), d = 520; const span = h('span', { class: 'money' }); el.replaceChildren(span);
+  const tick = now => { const k = Math.min(1, (now - t0) / d), e = 1 - Math.pow(1 - k, 3); span.textContent = money(from + (to - from) * e); if (k < 1 && span.isConnected) requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+}
 function placeTokensAnim(jailMap) {
   const layer = $('#tokens');
   S.players.forEach(p => {
@@ -1561,6 +1592,7 @@ function performMove(move) {
   const err = E.validateMove(S, move);
   if (err) { Snd.play('error'); return { success: false, error: err, state: viewText() }; }
   const prev = S;
+  move = Object.assign({}, move, { entropy: cryptoInt() }); // المضيف/الجهاز فقط يولّد العشوائية — لا يتحكم بها أي ضيف
   S = E.applyMove(S, move);
   save(); broadcastState(true);
   const events = S.events;
@@ -1608,7 +1640,7 @@ function startGame(config) {
   ui.speed = config.speed || lobby.speed || 'normal';
   if (config.sound === false) Snd.on = false;
   const players = (config.players || []).map((p, i) => ({ name: (p.name || '').trim() || DEFAULT_NAMES[i], isAI: !!p.isAI, token: p.token ?? i, color: p.color ?? p.token ?? i, team: p.team }));
-  S = E.createGame({ players, startCash: config.startCash || C.START_CASH, seed: config.seed, allowForcedDice: !!config.allowForcedDice, map: config.map || 'original', rules: config.rules });
+  S = E.createGame({ players, startCash: config.startCash || C.START_CASH, seed: config.seed ?? cryptoInt(), allowForcedDice: !!config.allowForcedDice, map: config.map || 'original', rules: config.rules });
   enterGame();
   return viewText();
 }
