@@ -2022,9 +2022,9 @@ function miniBoard(m) {
 
 /* ============================================================
  * الشبكة — اللعب أونلاين: المضيف يملك الحالة ويطبق القوانين، والضيوف يرسلون حركاتهم فقط.
- * النقل: PeerJS (WebRTC، يعمل على أي استضافة ثابتة مثل Vercel). ?transport=bc للاختبار داخل متصفح واحد.
+ * النقل: خوادم MQTT عامة عبر WebSocket آمن (يعمل بين أي شبكتين وعلى أي استضافة ثابتة مثل Vercel).
+ * ?broker=ws://... لتحديد خادم (للاختبار)، ?transport=bc للاختبار داخل متصفح واحد.
  * ============================================================ */
-const NET_PREFIX = 'mnply-v1-';
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const newCode = () => Array.from({ length: 5 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('');
 const useBC = /[?&]transport=bc\b/.test(location.search);
@@ -2036,24 +2036,105 @@ const Net = {
 const isOnline = () => !!Net.role;
 const isGuest = () => Net.role === 'guest';
 const isHost = () => Net.role === 'host';
-const roomLink = code => location.origin + location.pathname + '?room=' + code + (useBC ? '&transport=bc' : '');
+const roomLink = code => location.origin + location.pathname + '?room=' + code + (useBC ? '&transport=bc' : '') + ((location.search.match(/[?&](broker=[^&]+)/) || [])[1] ? '&' + location.search.match(/[?&](broker=[^&]+)/)[1] : '');
 
-function loadPeerJS() {
-  if (window.Peer) return Promise.resolve();
-  const srcs = ['https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'];
-  return srcs.reduce((pr, src) => pr.catch(() => new Promise((res, rej) => {
-    const s = document.createElement('script'); s.src = src; s.async = true;
-    s.onload = () => (window.Peer ? res() : rej()); s.onerror = () => { s.remove(); rej(); }; document.head.append(s);
-  })), Promise.reject()).catch(() => { throw new Error('تعذّر تحميل مكتبة الاتصال — تأكد من اتصالك بالإنترنت'); });
+/* ---------- عميل MQTT مصغّر فوق WebSocket (MQTT 3.1.1، QoS 0) — بلا مكتبات ----------
+ * كل لاعب يتصل للخارج بخادم وسيط عام عبر wss، فيعمل الاتصال بين أي شبكتين (بيت، جامعة، بيانات الهاتف)
+ * دون الحاجة لاتصال مباشر بين الأجهزة. المضيف يتصل بعدة خوادم في الوقت نفسه احتياطاً. */
+const BROKERS = (() => {
+  const q = (location.search.match(/[?&]broker=([^&]+)/) || [])[1];
+  if (q) return decodeURIComponent(q).split(',').map(url => ({ url }));
+  return [
+    { url: 'wss://broker.emqx.io:8084/mqtt' },
+    { url: 'wss://broker.hivemq.com:8884/mqtt' },
+    { url: 'wss://public.cloud.shiftr.io', user: 'public', pass: 'public' },
+    { url: 'wss://test.mosquitto.org:8081/mqtt' },
+  ];
+})();
+const enc = new TextEncoder(), dec = new TextDecoder();
+const mqStr = s => { const b = enc.encode(s); return [b.length >> 8, b.length & 255, ...b]; };
+const mqLen = n => { const o = []; do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; o.push(d); } while (n > 0); return o; };
+const mqPacket = (b0, body) => { const head = [b0, ...mqLen(body.length)]; const out = new Uint8Array(head.length + body.length); out.set(head, 0); out.set(body, head.length); return out; };
+class Mqtt {
+  constructor(cfg, opts) { this.cfg = cfg; this.o = opts || {}; this.subs = new Set(); this.hs = {}; this.pid = 1; this.closed = false; this.connected = false; this.retry = 0; this.q = []; this.buf = new Uint8Array(0); }
+  on(ev, f) { (this.hs[ev] = this.hs[ev] || []).push(f); }
+  emit(ev, ...a) { (this.hs[ev] || []).forEach(f => { try { f(...a); } catch (e) { console.error(e); } }); }
+  connect(timeout) {
+    return new Promise((res, rej) => {
+      let done = false, ws;
+      const fail = err => { if (done) return; done = true; clearTimeout(t); try { ws && ws.close(); } catch (e) { /* */ } rej(err); };
+      const t = setTimeout(() => fail(new Error('timeout')), timeout || 7000);
+      try { ws = this.ws = new WebSocket(this.cfg.url, ['mqtt']); } catch (e) { fail(e); return; }
+      ws.binaryType = 'arraybuffer';
+      this.buf = new Uint8Array(0);
+      ws.onopen = () => ws.send(this.pkConnect());
+      ws.onmessage = e => this.feed(new Uint8Array(e.data), ok => { if (done) return; done = true; clearTimeout(t); ok ? res() : rej(new Error('refused')); });
+      ws.onerror = () => {};
+      ws.onclose = () => {
+        const was = this.connected; this.connected = false; clearInterval(this.pingT);
+        if (!done) { fail(new Error('closed')); return; }
+        if (!this.closed) { if (was) this.emit('offline'); this.reconnectLater(); }
+      };
+    });
+  }
+  reconnectLater() {
+    if (this.closed || this.rT) return;
+    const delay = Math.min(8000, 400 * Math.pow(2, this.retry++)) + Math.random() * 300;
+    this.rT = setTimeout(() => { this.rT = null; if (this.closed) return; this.connect().catch(() => this.reconnectLater()); }, delay);
+  }
+  pkConnect() {
+    const o = this.o, c = this.cfg, will = o.will;
+    let flags = 0x02; if (will) flags |= 0x04; if (c.user) flags |= 0x80; if (c.pass) flags |= 0x40;
+    this.clientId = 'mn' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36).slice(-5);
+    const body = [...mqStr('MQTT'), 4, flags, 0, 30, ...mqStr(this.clientId)];
+    if (will) body.push(...mqStr(will.topic), ...mqStr(will.payload));
+    if (c.user) body.push(...mqStr(c.user)); if (c.pass) body.push(...mqStr(c.pass));
+    return mqPacket(0x10, body);
+  }
+  feed(chunk, onConnack) {
+    const b = new Uint8Array(this.buf.length + chunk.length); b.set(this.buf, 0); b.set(chunk, this.buf.length); this.buf = b;
+    for (;;) {
+      const buf = this.buf; if (buf.length < 2) return;
+      let len = 0, mult = 1, i = 1, byte;
+      do { if (i >= buf.length) return; byte = buf[i++]; len += (byte & 127) * mult; mult *= 128; } while (byte & 128);
+      if (buf.length < i + len) return;
+      const type = buf[0] >> 4, flags = buf[0] & 15, p = buf.subarray(i, i + len);
+      this.buf = buf.slice(i + len);
+      if (type === 2) { // CONNACK
+        const ok = p[1] === 0;
+        if (ok) {
+          this.connected = true; this.retry = 0;
+          this.subs.forEach(tp => this.sendSub(tp));
+          clearInterval(this.pingT); this.pingT = setInterval(() => { try { this.ws.send(new Uint8Array([0xC0, 0])); } catch (e) { /* */ } }, 20000);
+          const q = this.q; this.q = []; q.forEach(([tp, pl]) => this.publish(tp, pl));
+          this.emit('online');
+        }
+        onConnack && onConnack(ok);
+      } else if (type === 3) { // PUBLISH
+        const tl = (p[0] << 8) | p[1], topic = dec.decode(p.subarray(2, 2 + tl));
+        const off = 2 + tl + (((flags >> 1) & 3) ? 2 : 0);
+        this.emit('message', topic, dec.decode(p.subarray(off)));
+      }
+    }
+  }
+  sendSub(topic) { const id = this.pid = (this.pid % 65535) + 1; try { this.ws.send(mqPacket(0x82, [id >> 8, id & 255, ...mqStr(topic), 0])); } catch (e) { /* */ } }
+  subscribe(topic) { this.subs.add(topic); if (this.connected) this.sendSub(topic); }
+  publish(topic, payload) {
+    if (!this.connected) { this.q.push([topic, payload]); if (this.q.length > 30) this.q.shift(); return false; }
+    try { this.ws.send(mqPacket(0x30, [...mqStr(topic), ...enc.encode(payload)])); return true; } catch (e) { return false; }
+  }
+  close() { this.closed = true; clearTimeout(this.rT); clearInterval(this.pingT); try { if (this.connected) this.ws.send(new Uint8Array([0xE0, 0])); this.ws.close(); } catch (e) { /* */ } this.connected = false; }
 }
-/* نقل تجريبي عبر BroadcastChannel بنفس واجهة اتصال PeerJS */
-class BCConn {
-  constructor(ch, me, other) { this.ch = ch; this.me = me; this.other = other; this.hs = {}; this.open = true; }
-  on(ev, fn) { (this.hs[ev] = this.hs[ev] || []).push(fn); }
-  emit(ev, x) { (this.hs[ev] || []).forEach(f => f(x)); }
+const topicOf = code => `mnply2/${code}/`;
+class Emitter { constructor() { this.hs = {}; } on(ev, f) { (this.hs[ev] = this.hs[ev] || []).push(f); } emit(ev, x) { (this.hs[ev] || []).forEach(f => { try { f(x); } catch (e) { console.error(e); } }); } }
+
+/* نقل تجريبي عبر BroadcastChannel بنفس الواجهة */
+class BCConn extends Emitter {
+  constructor(ch, me, other) { super(); this.ch = ch; this.me = me; this.other = other; this.open = true; }
   send(d) { this.ch.postMessage({ to: this.other, from: this.me, k: 'data', d: JSON.parse(JSON.stringify(d)) }); }
   close() { if (!this.open) return; this.open = false; try { this.ch.postMessage({ to: this.other, from: this.me, k: 'close' }); } catch (e) { /* */ } this.emit('close'); }
 }
+/* المضيف: يتصل بكل الخوادم المتاحة، يستقبل من الضيوف على /u ويرسل على /d */
 function hostTransport(code, onConn) {
   if (useBC) {
     const ch = new BroadcastChannel('mono-' + code), conns = {};
@@ -2064,15 +2145,33 @@ function hostTransport(code, onConn) {
     };
     return Promise.resolve({ destroy() { Object.values(conns).forEach(c => c.close()); ch.close(); } });
   }
-  return loadPeerJS().then(() => new Promise((res, rej) => {
-    const peer = new window.Peer(NET_PREFIX + code, { debug: 0 });
-    let ready = false;
-    peer.on('open', () => { ready = true; res(peer); });
-    peer.on('connection', conn => conn.on('open', () => onConn(conn)));
-    peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) { /* */ } });
-    peer.on('error', err => { if (!ready) { peer.destroy(); rej(err.type === 'unavailable-id' ? Object.assign(new Error('taken'), { taken: true }) : new Error('تعذّر إنشاء الغرفة — تأكد من الإنترنت ثم حاول مجدداً')); } });
-  }));
+  const T = topicOf(code), conns = {};
+  const clients = BROKERS.map(b => new Mqtt(b, { will: { topic: T + 'd', payload: JSON.stringify({ to: '*', d: { t: 'hostdrop' } }) } }));
+  const pub = obj => { const s = JSON.stringify(obj); let n = 0; clients.forEach(c => { if (c.connected && c.publish(T + 'd', s)) n++; }); return n; };
+  const drop = c => { if (conns[c.cid] !== c) return; delete conns[c.cid]; c.open = false; c.emit('close'); };
+  const vconn = cid => { const c = new Emitter(); Object.assign(c, { cid, open: true, lastSeen: Date.now(), send: d => pub({ to: cid, d }), close: () => drop(c) }); return c; };
+  const handle = (topic, txt) => {
+    let m; try { m = JSON.parse(txt); } catch (e) { return; }
+    if (!m || typeof m.from !== 'string' || !m.d || typeof m.d.t !== 'string') return;
+    let c = conns[m.from];
+    if (m.d.t === 'bye') { if (c) drop(c); return; }
+    if (!c) { c = conns[m.from] = vconn(m.from); onConn(c); if (m.d.t !== 'hello') c.send({ t: 'who' }); }
+    c.lastSeen = Date.now();
+    if (m.d.t !== 'ping') c.emit('data', m.d);
+  };
+  clients.forEach(c => { c.subscribe(T + 'u'); c.on('message', handle); });
+  const hb = setInterval(() => pub({ to: '*', d: { t: 'hb' } }), 3000);
+  const sweep = setInterval(() => { const now = Date.now(); Object.values(conns).forEach(c => { if (now - c.lastSeen > 15000) drop(c); }); }, 3000);
+  const api = { broadcast: d => pub({ to: '*', d }), online: () => clients.filter(c => c.connected).length,
+    destroy() { clearInterval(hb); clearInterval(sweep); clients.forEach(c => c.close()); } };
+  return new Promise((res, rej) => {
+    let left = clients.length, resolved = false;
+    clients.forEach(c => c.connect(7000).then(() => {
+      if (!resolved) { resolved = true; setTimeout(() => res(api), 600); pub({ to: '*', d: { t: 'hb' } }); }
+    }, () => { c.reconnectLater(); if (--left === 0 && !resolved) { api.destroy(); rej(new Error('تعذّر الوصول إلى خوادم الاتصال — تحقق من الإنترنت ثم حاول مجدداً')); } }));
+  });
 }
+/* الضيف: يجرّب الخوادم بالتوازي ويختار أول خادم يسمع عليه نبض المضيف */
 function guestTransport(code) {
   if (useBC) return new Promise((res, rej) => {
     const ch = new BroadcastChannel('mono-' + code), me = 'g-' + Net.cid;
@@ -2082,15 +2181,68 @@ function guestTransport(code) {
     conn.destroy = () => { conn.close(); ch.close(); };
     ch.postMessage({ to: 'host', from: me, k: 'open' });
   });
-  return loadPeerJS().then(() => new Promise((res, rej) => {
-    const peer = new window.Peer({ debug: 0 });
-    const timer = setTimeout(() => { peer.destroy(); rej(new Error('انتهت مهلة الاتصال — تأكد من الكود والإنترنت')); }, 15000);
-    peer.on('open', () => {
-      const conn = peer.connect(NET_PREFIX + code, { reliable: true, serialization: 'json' });
-      conn.on('open', () => { clearTimeout(timer); conn.destroy = () => peer.destroy(); res(conn); });
+  const T = topicOf(code), me = Net.cid;
+  return new Promise((res, rej) => {
+    let chosen = null, reachable = 0, failed = 0;
+    const clients = BROKERS.map(b => new Mqtt(b, { will: { topic: T + 'u', payload: JSON.stringify({ from: me, d: { t: 'bye' } }) } }));
+    const finish = (first) => {
+      chosen = first; clearTimeout(timer);
+      clients.forEach(c => { if (c !== first) c.close(); });
+      const conn = new Emitter();
+      let client = null, lastHost = Date.now(), waiting = false, alive = true, offlineSince = 0, switching = false;
+      const send = d => client && client.publish(T + 'u', JSON.stringify({ from: me, d }));
+      const onMsg = (tp, txt) => {
+        let m; try { m = JSON.parse(txt); } catch (e) { return; }
+        if (!m || !m.d || (m.to !== me && m.to !== '*')) return;
+        lastHost = Date.now();
+        if (waiting) { waiting = false; conn.emit('status', 'back'); }
+        if (m.d.t === 'hb') return;
+        if (m.d.t === 'hostdrop') { waiting = true; conn.emit('status', 'hostdrop'); return; }
+        conn.emit('data', m.d);
+      };
+      const attach = c => {
+        client = c; offlineSince = 0;
+        c.on('message', (tp, txt) => { if (client === c) onMsg(tp, txt); });
+        c.on('offline', () => { if (client !== c) return; offlineSince = Date.now(); conn.emit('status', 'offline'); });
+        c.on('online', () => { if (client !== c) return; offlineSince = 0; conn.emit('reconnect'); });
+      };
+      attach(first);
+      // إن بقي الخادم الحالي غير متاح، ننتقل لخادم آخر (المضيف متصل بكل الخوادم)
+      const trySwitch = () => {
+        if (switching || !alive) return; switching = true;
+        const old = client;
+        const cands = BROKERS.filter(b => b !== old.cfg).map(b => new Mqtt(b, { will: { topic: T + 'u', payload: JSON.stringify({ from: me, d: { t: 'bye' } }) } }));
+        let pending = cands.length, won = false;
+        if (!pending) { switching = false; return; }
+        cands.forEach(c => { c.subscribe(T + 'd'); c.connect(6000).then(() => {
+          if (won || !alive || client !== old || old.connected) { c.close(); if (--pending === 0) switching = false; return; }
+          won = true; old.close(); attach(c); switching = false; conn.emit('reconnect');
+          cands.forEach(o => { if (o !== c) o.close(); });
+        }, () => { c.close(); if (--pending === 0 && !won) switching = false; }); });
+      };
+      const ping = setInterval(() => send({ t: 'ping' }), 4000);
+      const watch = setInterval(() => {
+        const gap = Date.now() - lastHost;
+        if (offlineSince && Date.now() - offlineSince > 6000) trySwitch();
+        if (gap > 10000 && !waiting) { waiting = true; conn.emit('status', 'waiting'); }
+        if (gap > 120000 && alive) { alive = false; conn.destroy(); conn.emit('close'); }
+      }, 2000);
+      conn.send = send;
+      conn.destroy = () => { alive = false; clearInterval(ping); clearInterval(watch); try { send({ t: 'bye' }); } catch (e) { /* */ } const c = client; setTimeout(() => c && c.close(), 150); };
+      conn.close = conn.destroy;
+      res(conn);
+    };
+    const timer = setTimeout(() => {
+      clients.forEach(c => c.close());
+      rej(new Error(reachable ? 'لم نجد غرفة بهذا الكود — تأكد منه، وأن صفحة الغرفة ما زالت مفتوحة عند المضيف' : 'تعذّر الوصول إلى خوادم الاتصال — تحقق من الإنترنت ثم حاول مجدداً'));
+    }, 12000);
+    clients.forEach(c => {
+      c.subscribe(T + 'd');
+      c.on('message', (tp, txt) => { if (chosen) return; let m; try { m = JSON.parse(txt); } catch (e) { return; } if (m && (m.to === '*' || m.to === me)) finish(c); });
+      c.connect(7000).then(() => { reachable++; c.publish(T + 'u', JSON.stringify({ from: me, d: { t: 'ping' } })); },
+        () => { if (++failed === clients.length) { clearTimeout(timer); rej(new Error('تعذّر الوصول إلى خوادم الاتصال — تحقق من الإنترنت ثم حاول مجدداً')); } });
     });
-    peer.on('error', err => { clearTimeout(timer); peer.destroy(); rej(new Error(err.type === 'peer-unavailable' ? 'لم نجد غرفة بهذا الكود — تأكد منه أو اطلب رابطاً جديداً' : 'تعذّر الاتصال بالغرفة')); });
-  }));
+  });
 }
 const cleanProfile = m => ({ name: String(m.name || 'لاعب').trim().slice(0, 14) || 'لاعب', token: (m.token | 0) % TOKENS.length, color: (m.color | 0) % COLORS });
 function fixDupes(seat) { // لا يتكرر الشكل/اللون داخل الغرفة
@@ -2102,9 +2254,34 @@ function lobbySnapshot() {
   return { players: Net.seats.map(s => ({ name: s.name, token: s.token, color: s.color, team: s.team, isAI: !!s.isAI, cid: s.cid || null })),
     map: lobby.map, cash: lobby.cash, speed: lobby.speed, rules: Object.assign({}, lobby.rules), teams: Object.assign({}, lobby.teams) };
 }
-function netBroadcast(msg) { Object.values(Net.conns).forEach(c => { try { c.send(msg); } catch (e) { /* */ } }); }
-function broadcastLobby() { if (isHost()) netBroadcast({ t: 'lobby', lobby: lobbySnapshot(), code: Net.code }); }
-function broadcastState(anim) { if (!isHost() || !S) return; Net.seq++; netBroadcast({ t: 'state', state: S, seq: Net.seq, anim: !!anim }); }
+function netBroadcast(msg) {
+  if (Net.peer && Net.peer.broadcast) { Net.peer.broadcast(msg); return; } // رسالة واحدة لكل الضيوف
+  Object.values(Net.conns).forEach(c => { try { c.send(msg); } catch (e) { /* */ } });
+}
+function broadcastLobby() { if (isHost()) { netBroadcast({ t: 'lobby', lobby: lobbySnapshot(), code: Net.code }); saveHostSession(); } }
+function broadcastState(anim) { if (!isHost() || !S) return; Net.seq++; netBroadcast({ t: 'state', state: S, seq: Net.seq, anim: !!anim }); saveHostSession(); }
+/* حفظ جلسة المضيف في هذا التبويب: إن أعاد تحميل الصفحة تعود الغرفة بنفس الكود ويكمل الجميع */
+const HOST_KEY = 'mono-host-session', GUEST_KEY = 'mono-guest-room';
+let hostSaveT = null;
+function saveHostSession() {
+  if (!isHost()) return;
+  clearTimeout(hostSaveT);
+  hostSaveT = setTimeout(() => { try { sessionStorage.setItem(HOST_KEY, JSON.stringify({ code: Net.code, seats: Net.seats.map(s => Object.assign({}, s)), seatCids: Net.seatCids, wasHuman: Net.wasHuman, inGame: Net.inGame, seq: Net.seq, state: Net.inGame ? S : null, speed: ui.speed, at: Date.now() })); } catch (e) { /* */ } }, 300);
+}
+function saveHostSessionNow() { clearTimeout(hostSaveT); try { sessionStorage.setItem(HOST_KEY, JSON.stringify({ code: Net.code, seats: Net.seats.map(s => Object.assign({}, s)), seatCids: Net.seatCids, wasHuman: Net.wasHuman, inGame: Net.inGame, seq: Net.seq, state: Net.inGame ? S : null, speed: ui.speed, at: Date.now() })); } catch (e) { /* */ } }
+const helloMsg = () => { const me = lobby.players[0]; return { t: 'hello', cid: Net.cid, name: me.name, token: me.token, color: me.color }; };
+async function resumeHost(d) {
+  Net.busy = true; Net.status = 'جارٍ استعادة الغرفة…'; renderLobby();
+  try {
+    const peer = await hostTransport(d.code, onHostConn);
+    lobby.mode = 'online';
+    Object.assign(Net, { role: 'host', code: d.code, peer, conns: {}, mySeat: 0, seq: d.seq || 0, inGame: !!d.inGame, wasHuman: d.wasHuman || {}, seatCids: d.seatCids || [], status: '' });
+    Net.seats = d.seats || []; Net.seats[0] = Object.assign(lobby.players[0], Net.seats[0] || {}, { cid: Net.cid, isAI: false });
+    if (Net.inGame && d.state) { S = d.state; ui.speed = d.speed || 'normal'; enterGame(); broadcastState(false); toast('عادت الغرفة — يكمل الجميع من حيث توقفوا', 3000); }
+    else { broadcastLobby(); }
+  } catch (e) { Net.status = e.message; toast(e.message, 4000); }
+  Net.busy = false; if (!S) renderLobby();
+}
 
 async function createRoom() {
   if (Net.busy) return;
@@ -2116,9 +2293,10 @@ async function createRoom() {
       try { peer = await hostTransport(code, onHostConn); } catch (e) { if (!e.taken) throw e; }
     }
     if (!peer) throw new Error('تعذّر إنشاء الغرفة');
-    Object.assign(Net, { role: 'host', code, peer, conns: {}, mySeat: 0, seq: 0, inGame: false, wasHuman: {}, status: '' });
+    Object.assign(Net, { role: 'host', code, peer, conns: {}, mySeat: 0, seq: 0, inGame: false, wasHuman: {}, seatCids: [], status: '' });
     const me = lobby.players[0]; me.isAI = false;
     Net.seats = [Object.assign(me, { cid: Net.cid })];
+    saveHostSession();
     try { history.replaceState(null, '', roomLink(code)); } catch (e) { /* */ }
   } catch (e) { Net.status = e.message; toast(e.message, 4000); }
   Net.busy = false; renderLobby();
@@ -2188,7 +2366,15 @@ async function joinRoom(code) {
   try {
     const conn = await guestTransport(code);
     Object.assign(Net, { role: 'guest', code, host: conn, snapshot: null, mySeat: null, status: 'متصل — بانتظار المضيف ليبدأ اللعبة' });
+    try { sessionStorage.setItem(GUEST_KEY, code); } catch (e) { /* */ }
     conn.on('data', onGuestMsg);
+    conn.on('reconnect', () => { if (Net.host === conn) { conn.send(helloMsg()); toast('عاد الاتصال ✓', 1800); } });
+    conn.on('status', s => {
+      if (Net.host !== conn) return;
+      if (s === 'offline') toast('انقطع الإنترنت — نحاول إعادة الاتصال…', 3000);
+      else if (s === 'hostdrop' || s === 'waiting') { toast('المضيف غير متصل حالياً — بانتظار عودته…', 3500); Net.status = 'بانتظار عودة المضيف…'; if (!S) renderLobby(); }
+      else if (s === 'back') { conn.send(helloMsg()); Net.status = S ? '' : 'متصل — بانتظار المضيف ليبدأ اللعبة'; toast('عاد المضيف ✓', 1800); if (!S) renderLobby(); }
+    });
     conn.on('close', () => {
       if (Net.host !== conn) return;
       toast('انقطع الاتصال بالمضيف', 4000);
@@ -2196,14 +2382,14 @@ async function joinRoom(code) {
       Net.status = 'انقطع الاتصال — يمكنك إعادة الانضمام بالكود ' + c; lobby.joinCode = c;
       if (S) showLobby(); else renderLobby();
     });
-    const me = lobby.players[0];
-    conn.send({ t: 'hello', cid: Net.cid, name: me.name, token: me.token, color: me.color });
+    conn.send(helloMsg());
     try { history.replaceState(null, '', roomLink(code)); } catch (e) { /* */ }
   } catch (e) { Net.status = e.message; toast(e.message, 4000); }
   Net.busy = false; renderLobby();
 }
 function onGuestMsg(m) {
   if (!m || typeof m.t !== 'string') return;
+  if (m.t === 'who') { Net.host && Net.host.send(helloMsg()); return; }
   if (m.t === 'lobby') {
     Net.snapshot = m.lobby; Net.mySeat = m.lobby.players.findIndex(p => p.cid === Net.cid);
     if (S) { S = null; Net.inGame = false; closeModal(true); $('#game').classList.add('hidden'); $('#lobby').classList.remove('hidden'); }
@@ -2233,8 +2419,9 @@ function leaveRoom(silent) {
   if (isHost()) { netBroadcast({ t: 'end' }); Object.values(Net.conns).forEach(c => { try { c.close(); } catch (e) { /* */ } }); try { Net.peer && Net.peer.destroy(); } catch (e) { /* */ } }
   if (isGuest()) { try { Net.host.destroy ? Net.host.destroy() : Net.host.close(); } catch (e) { /* */ } }
   Object.assign(Net, { role: null, code: null, peer: null, conns: {}, host: null, seats: [], snapshot: null, mySeat: null, inGame: false, seatCids: [], wasHuman: {}, status: silent ? Net.status : '' });
+  clearTimeout(hostSaveT); try { sessionStorage.removeItem(HOST_KEY); sessionStorage.removeItem(GUEST_KEY); } catch (e) { /* */ }
   lobby.players[0].isAI = false;
-  try { history.replaceState(null, '', location.pathname + (useBC ? '?transport=bc' : '')); } catch (e) { /* */ }
+  try { const bq = (location.search.match(/[?&](broker=[^&]+)/) || [])[1]; history.replaceState(null, '', location.pathname + (useBC ? '?transport=bc' : bq ? '?' + bq : '')); } catch (e) { /* */ }
 }
 let profileTimer = null;
 function sendProfile() {
@@ -2375,6 +2562,7 @@ function lobbyStart() {
   if (isHost()) { Net.seatCids = Net.seats.map(s => s.cid || null); Net.inGame = true; Net.wasHuman = {}; }
   startGame({ players, startCash: lobby.cash, speed: lobby.speed, map: lobby.map, rules: Object.assign({}, lobby.rules) });
   if (isHost()) Object.values(Net.conns).forEach(c => { const seat = Net.seatCids.indexOf(c.cid); if (seat >= 0) c.send({ t: 'start', state: S, seat, seq: Net.seq, speed: ui.speed }); });
+  saveHostSession();
 }
 function showLobby() {
   if (ui.aiTimer) { clearTimeout(ui.aiTimer); ui.aiTimer = null; }
@@ -3146,7 +3334,14 @@ function init() {
   $('#start-btn').addEventListener('click', lobbyStart);
   $('#leave-btn').addEventListener('click', () => { leaveRoom(); renderLobby(); });
   const qRoom = (location.search.match(/[?&]room=([A-Za-z0-9]{5})/) || [])[1];
-  if (qRoom) { lobby.mode = 'online'; lobby.joinCode = qRoom.toUpperCase(); renderLobby(); toast('اكتب اسمك واختر قطعتك ثم اضغط «انضم»', 4000); setTimeout(() => { const i = $('[data-player-config="0"] input'); i && i.focus(); }, 50); }
+  let hostSess = null, guestRoom = null;
+  try { hostSess = JSON.parse(sessionStorage.getItem(HOST_KEY)); guestRoom = sessionStorage.getItem(GUEST_KEY); } catch (e) { /* */ }
+  if (qRoom && hostSess && hostSess.code === qRoom.toUpperCase()) resumeHost(hostSess); // المضيف أعاد تحميل الصفحة
+  else if (qRoom) {
+    lobby.mode = 'online'; lobby.joinCode = qRoom.toUpperCase(); renderLobby();
+    if (guestRoom === lobby.joinCode) joinRoom(lobby.joinCode); // الضيف أعاد تحميل الصفحة: انضمام تلقائي لمقعده
+    else { toast('اكتب اسمك واختر قطعتك ثم اضغط «انضم»', 4000); setTimeout(() => { const i = $('[data-player-config="0"] input'); i && i.focus(); }, 50); }
+  }
   $('#resume-btn').addEventListener('click', () => {
     const d = loadSave(); if (!d) return;
     Snd.init(); S = d.state; ui.speed = d.speed || 'normal'; Snd.on = d.sound !== false;
@@ -3160,7 +3355,9 @@ function init() {
       h('div', { class: 'btns' }, btn(isGuest() ? 'نعم، غادر' : 'نعم، لعبة جديدة', () => { clearSave(); if (isGuest()) leaveRoom(); showLobby(); }, '', { 'data-action': 'confirm-new' }), btn('تابع اللعب', () => closeModal(), 'secondary')));
   }));
   window.addEventListener('resize', () => { sizeBoard(); });
-  window.addEventListener('pagehide', () => { if (isOnline()) leaveRoom(true); });
+  window.addEventListener('pagehide', () => { // إعادة التحميل لا تُنهي الغرفة: الجلسة محفوظة وتعود تلقائياً
+    try { if (isGuest() && Net.host) Net.host.destroy(); if (isHost() && Net.peer) { saveHostSessionNow(); Net.peer.broadcast({ t: 'hostdrop' }); Net.peer.destroy(); } } catch (e) { /* */ }
+  });
   sizeBoard();
 }
 
@@ -3170,7 +3367,7 @@ window.performMove = performMove;
 window.startGame = startGame;
 window.getPlayerView = (state, id) => E.getPlayerView(state || S, id);
 window.__net = { state: () => ({ role: Net.role, code: Net.code, mySeat: Net.mySeat, seats: (isHost() ? Net.seats : (Net.snapshot || { players: [] }).players).length, inGame: Net.inGame, status: Net.status }), createRoom, joinRoom, leaveRoom };
-window.__ui = { isIdle: () => !!S && ui.pending === 0 && !ui.aiTimer && !ui.cardOpen, state: () => S, setState: s => { S = s; renderAll(); scheduleAI(); }, openManage, openTradeBuilder, closeModal, speed: v => { ui.speed = v; } };
+window.__ui = { netBusy: () => ui.netWait, isIdle: () => !!S && ui.pending === 0 && !ui.aiTimer && !ui.cardOpen, state: () => S, setState: s => { S = s; renderAll(); scheduleAI(); }, openManage, openTradeBuilder, closeModal, speed: v => { ui.speed = v; } };
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();

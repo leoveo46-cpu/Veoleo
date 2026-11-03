@@ -5,7 +5,7 @@
   "description": "Monopoly — لعبة مونوبولي عربية للمتصفح مع لعب أونلاين",
   "scripts": {
     "bundle": "python build.py",
-    "test": "node tests/engine.test.js && node tests/browser.test.js && node tests/online.test.js",
+    "test": "node tests/engine.test.js && node tests/browser.test.js && node tests/online.test.js && node tests/relay.test.js",
     "deploy": "npx vercel --prod"
   }
 }
