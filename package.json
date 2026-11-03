@@ -1,0 +1,11 @@
+{
+  "name": "monopoly-game",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Monopoly — لعبة مونوبولي عربية للمتصفح مع لعب أونلاين",
+  "scripts": {
+    "bundle": "python build.py",
+    "test": "node tests/engine.test.js && node tests/browser.test.js && node tests/online.test.js",
+    "deploy": "npx vercel --prod"
+  }
+}

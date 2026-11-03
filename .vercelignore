@@ -1,0 +1,9 @@
+# لا يُرفع إلى Vercel إلا index.html (اللعبة كاملة في ملف واحد)
+src
+tests
+build.py
+progress.md
+README.md
+package.json
+node_modules
+*.log
